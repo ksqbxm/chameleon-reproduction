@@ -20,9 +20,10 @@ def profile_directory():
 def schema_profile():
     # Handwritten schema fixture, never substituted for live CPU/CUDA measurements.
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "identity": {"model_hash": "a" * 64, "config_hash": "b" * 64,
                      "module_parameter_bytes": {"embedding": 80},
+                     "module_order": ["embedding"],
                      "device": {"type": "cpu", "index": None, "torch": "schema-fixture",
                                 "name": "schema-fixture", "system": "schema-fixture"},
                      "parallel": {"dp_size": 1, "pp_size": 1, "rank": 0}},
@@ -82,7 +83,7 @@ def test_reject_missing_top_level_fields(schema_profile, field):
 
 
 @pytest.mark.parametrize("path,value", [
-    (("schema_version",), 1), (("schema_version",), 3), (("schema_version",), True),
+    (("schema_version",), 1), (("schema_version",), 2), (("schema_version",), 4), (("schema_version",), True),
     (("metrics", "step_time_s", "samples"), []),
     (("metrics", "step_time_s", "samples"), [float("nan")]),
     (("metrics", "step_time_s", "ema"), 9.),
@@ -173,6 +174,7 @@ def test_reject_missing_module_samples(schema_profile, field):
 def test_reject_incomplete_module_inventory_from_model_manifest(schema_profile):
     payload = deepcopy(schema_profile)
     payload["identity"]["module_parameter_bytes"]["lm_head"] = 20
+    payload["identity"]["module_order"].append("lm_head")
     with pytest.raises(ValueError, match="module inventory"):
         validate_snapshot(payload, payload["identity"])
 
@@ -233,8 +235,9 @@ def test_1f1b_phase_order_matches_handwritten_stage_zero_oracle(schema_profile, 
     payload["steps"][0]["trace"] = trace
     payload["metrics"]["step_time_s"] = {"samples": [time_s + 0.2], "ema": time_s + 0.2}
     payload["metrics"]["step_wall_time_s"] = {"samples": [time_s + 0.3], "ema": time_s + 0.3}
-    for field in ("forward_s", "backward_s", "output_activation_bytes"):
+    for field in ("forward_s", "backward_s", "output_activation_bytes", "saved_activation_bytes"):
         payload["metrics"][f"modules.embedding.{field}"]["samples"] *= len(operations) // 2
+    payload["metrics"]["modules.loss_and_runtime.saved_activation_bytes"]["samples"] *= len(operations) // 2
     validate_snapshot(payload, payload["identity"])
     payload["steps"][0]["trace"][-1]["phase"] = "steady"
     with pytest.raises(ValueError, match="1F1B"):

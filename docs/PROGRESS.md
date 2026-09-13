@@ -1,6 +1,6 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现。本机无需 torch 的单测已通过，训练数值测试因缺少 torch 尚未执行成功；真实 CPU/Gloo、服务器 GPU/NCCL 和恢复验收仍待执行。真实 GPU 验收由用户在服务器启动；本次按用户最新要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出，未执行 GPU 测试。用户回传 Task 03 CUDA 70 passed / 1 failed，浮点精确比较断言已修正，待服务器重跑。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
 
 ## 状态
 
@@ -10,7 +10,8 @@
 | 02 | 已修正 optimizer 完成与 commit 的时序；非 torch 单测已验；CPU/GPU 数值待验 | 最新全量回归中 17 passed / 15 errors；训练/模型测试因缺少 torch 报错；GPU 未执行 |
 | 03 | owner 清单/重叠检查已实现；CUDA 浮点断言已修正；待服务器重跑验收 | 用户回传 CUDA 70 passed / 1 failed；修正后本机 CPU 32 passed / 39 errors，CUDA 配置阶段退出，均因缺少 torch |
 | 04 | 服务器全仓回归通过；NGC 版本表示检查已修正；双 GPU 校准待重跑 | 用户回传全仓 318 passed、Task04 CUDA 115 passed / 3 setup errors（环境合同阻断）；本次合同测试 54 passed；原 CUDA 命令本机因缺 torch 配置阶段退出 |
-| 05-15 | 待实施 | 未执行 |
+| 05 | 算法单测已验；真实 CPU profile 接入待验 | 审阅后 Task05 161 passed / 3 errors（缺 torch）；全仓 421 passed / 89 errors（缺 torch）；GPU runtime 闭环在 09/10 |
+| 06-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -276,6 +277,81 @@ python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roun
 
 ```bash
 python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/distributed/test_transfer_calibration.py -q --device cuda --world-size 2 --require-gpu --junitxml=artifacts/test-results/task04-server-gpu.xml
+```
+
+## Task 05 实现与开发验证（2026-09-13）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task 05、Task 06 接口需求、既有 Profiler/模型/合同及测试；适用父目录与仓库未发现额外 AGENTS.md。严格遵循最小实现、局部修改和唯一进度文件规则。
+- 公式核对依据为论文 [arXiv v4 Estimator 原文](https://arxiv.org/html/2508.21613v4#S4.SS3)。仓库没有论文文件或配置的 paper_path；未硬编码主机论文位置。
+- 修改范围：新增 `src/chameleon/schedule.py`、`src/chameleon/estimators.py`、`tests/unit/test_1f1b_schedule.py`、`tests/unit/test_estimators.py`、`tests/integration/test_profile_estimator.py`；仅修改 Profiler 的顺序校验和单 stage runner 以复用同一调度，以及本进度文件。未实施 Task 06 或后续功能，未修改依赖或环境。
+- 调度：每条 pipeline/stage 输出不可变 FIFO 1F1B 队列，标识 micro-batch、warmup/steady/cooldown、同 stage 前序操作、上游 forward、本地 forward 与下游 backward 依赖。单 stage 真实训练入口使用该队列；不把估计 trace 冒充实测 trace。
+- 时间：Eq.9 显式从 global micro-batches / DP 转为每 pipeline 数量，不均等整数分区必须改用非对称估计。Eq.11 以线性 DAG DP 求每个操作的 max(predecessor ends) + duration，支持逐操作不同耗时；Eq.10 取不同长度/分区 pipeline 中的最大时间。profile 接口校验唯一 version 2 格式及模型/配置/设备/并行 identity，汇总所有模块（含端点）的实测 forward/backward EMA，不填写缺失 timing 常量。
+- rerouting：单故障按 Eq.12，其他分布按 Eq.13；保留原 DP/layout 和每 pipeline Nm，逐 stage 导出额外计算 slots。Fi>=Ndp 在任何除法前返回不可行及具体 stage 原因，不承诺动态策略可以恢复已丢失的副本。
+- 内存：Eq.14 保留 average-layer 近似和 Npp-i 激活系数（Nm 少于 stages 时也保留论文近似），单独加入全部非 block 模块的 parameter/gradient/AdamW tensor 字节及其保存激活，loss/runtime 保存激活计入最后 stage。累计 saved activation 字节按实际 forward 次数转为每 micro-batch 成本。容量相等可行、超过容量返回逐 stage 的 static/dynamic/extra 原因。
+- 推导边界：输出 equation、batch scope、stage durations、操作依赖/时间及内存成本。时间为 computation 估计，尚未计入未测量的 P2P、gradient collectives、optimizer 与控制成本；逻辑 saved-tensor 字节可能包含别名重复，不等同物理峰值 HBM。GPU runtime 实测闭环按 Task 05 合同留在 09/10，不设置性能误差阈值。
+- 独立验证：手写 1F1B 顺序、独立图消除检查依赖无环；Eq.9/12/13/14 使用独立手算 fixture；Eq.11 用不读取生产 schedule/dependencies 的状态机与完成事件 heap oracle，逐操作核对 start/end。覆盖单 stage/单 micro-batch、Nm<stages、非均匀与逐 micro-batch 耗时、端点/新增模块、不可用 peer、batch 守恒、profile identity/缺失数据和内存临界点。
+- 真实 profile 测试已创建：实际 AdamW warmup 后采样两步，使用含 [2,2,1] samples 的 micro-batches，JSON 导出/加载后接入估计，检查端点与容量边界。人工 schema fixture 仅用于算法单测，不替代真实训练。
+- 本机环境：Windows / Python 3.13.12 / pytest 9.1.1，torch 不存在，device=cpu；不替代总计划的固定容器环境。没有安装、升级、降级依赖、访问服务器或执行 GPU 测试。
+
+实际运行记录（小功能后立即执行最窄测试）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/unit/test_1f1b_schedule.py -q --device cpu` | 0 | 45 passed |
+| 初版 `python -m pytest tests/unit/test_estimators.py -q --device cpu --tb=short` | 1 | 95 passed / 1 failed；手算 fixture 的容量抄写错误，修正为计算出的 239/74/167 字节 |
+| 修正 fixture 并加入单 stage 内存后的两文件单测组合 | 0 | 142 passed |
+| 初版 Task05 指定三文件组合 | 1 | 142 passed / 3 errors；真实 profile fixture 导入 torch 失败 |
+| 最终 `python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/integration/test_profile_estimator.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task05-cpu.xml` | 1 | 150 passed / 3 errors / 0 failures / 0 skipped；153 tests |
+| `python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task05-profiler-regression.xml` | 1 | 61 passed / 16 errors / 0 failures / 0 skipped；原有真实 torch 路径未执行到断言 |
+| `python -m pytest tests -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task05-regression.xml` | 1 | 409 passed / 89 errors / 0 failures / 0 skipped；498 tests |
+| `python -m compileall -q src tests`；`git diff --check` | 0 | 通过；不代表未运行的 torch 路径通过 |
+
+- 三份 JUnit 已核对计数及逐项错误：所有 errors 均为 `No module named 'torch'`。实际日志与 XML 同 basename，位于 `artifacts/test-results/`；汇总为 `task05-local-summary.json`。
+- 本 task 没有分布式 spawn/端口/rendezvous/kill；真实 profile 临时目录使用 finally 清理的标准库 TemporaryDirectory。本机缺 torch，尚未创建该临时目录或启动训练，不宣称实际执行了训练资源清理。
+- 最终审阅：检查全部新文件与 Profiler diff，未引入未声明第三方库、skip/fallback、旧格式 adapter、初始化恢复或额外进度文档。
+- 当前不能标 Task 05 验收完成，也不能标“CPU 已验”，因为其指定真实 CPU profile 接入仍未通过。Task 04 双 GPU 校准仍待服务器重跑；按用户要求已继续实施算法，不将前置未验状态隐去。
+
+固定容器中从项目工作目录运行以下验收命令（使用既有 python，无需安装项目或依赖）：
+
+```bash
+python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/integration/test_profile_estimator.py -q --device cpu --junitxml=artifacts/test-results/task05-server-cpu.xml
+```
+
+收到真实 CPU 完整日志/XML 后再确认 Task 05 验收状态；本 task 没有独立必测 GPU 命令，GPU runtime 闭环继续遵循 Task 09/10。
+
+## Task 05 审阅与优化（2026-09-13）
+
+- 按用户要求复核正确性、完备性和简洁性；遵循 `CLAUDE.md`，没有修改模型/data/reference/global loss、环境合同、依赖或后续任务。修改涉及 Task05 Estimator、相关 Profiler 采样/格式和对应测试，以及本进度文件；保留之前已实现的 Task05 调度与 runner 修改。
+- 首先用四项测试复现根本问题：合法 JSON 键排序导致模型布局被拒绝；末尾清空梯度后估计峰值从 428/389 降到 328/301；[12,12,6] 字节的 micro-batches 被平均为 10 而低估峰值 12；公开接口接受缺少 F→B 依赖的任意 operation 队列。实际结果为 4 failed / 105 deselected。
+- 激活采样：不再只保存整步累计字节；每个真实 forward 建立包含全部模块和 loss/runtime 的整数计数行，导出逐 forward 原始样本与 EMA，step memory 保存各模块的最大样本。Estimator 对全部实测原始样本取最大值，再在 layers 间求平均；端点逐项使用实际峰值，不因短末批或后来较小的采样擦除已测峰值。删除原累计字节除以 forward 次数的路径。
+- 梯度峰值：严格使用 Eq.14 的 mg=mp，包含 blocks 和端点。删除独立 average_gradient_bytes 输入，不把快照中已释放的梯度当作训练峰值零成本；profile 的 gradient inventory 仍如实记录采样结束时实际状态。
+- 模块顺序：identity 增加明确的 module_order，完整且唯一覆盖 module_parameter_bytes；布局以该序列校验，不再以 JSON 对象键顺序推断模型拓扑。
+- 格式变更：profile 唯一 schema 为 version 3，采样、校验、导出、加载、Estimator 和所有 profile fixture 同步更新。version 1/2 及其他版本直接拒绝，需要重新导出真实 profile；没有旧格式 adapter 或兼容分支。通信校准自身的独立 schema 未改变。
+- 调度接口：公开逐操作时间接口改为 durations + pipeline/stage/micro-batch 数，由唯一 schedule builder 构造完整依赖。删除任意队列输入及为其设置的重复/缺依赖/环检查；私有 DP 仅接收生成的合法调度，保留耗时完整性与有限性校验。逐 stage 和逐 operation 时间共用一个线性 DP 实现，全部调用处已更新。
+- 完备性补充：随后另外四项测试复现非峰值样本可含小数字节，以及调用方修改 layer_modules list 使内部集合为空并除零。字节原始样本现在逐项校验为非负整数；layer inventory 与 profile 一并复制。新增历史峰值保留及 module_order 缺失/重复/非法成员的回归。
+- 真实 autograd oracle 已同步改为独立记录每个 micro-batch 的完整 saved tensor 总字节，对照 Profiler 的逐模块原始样本求和；检查短末批及 step 最大值。现有 hook/event 泄漏测试同时检查新计数器释放。真实训练测试没有 mock、skip 或放宽数值容差。
+- 估计边界继续保留：Eq.14 是 average-layer 近似，逻辑 saved tensor 字节可重复计别名，不等同实际峰值 HBM；Eq.9/12/13 是均匀 stage 的论文近似；GPU runtime 实测闭环仍在 Task09/10。
+
+实际执行记录：
+
+| 命令 / 阶段 | 退出码 | 结果 |
+| --- | --- | --- |
+| `python -m pytest tests/unit/test_estimators.py -q --device cpu -k 'json_key_sorting or cleared_gradient or short_last or cannot_omit' --tb=short --junitxml=artifacts/test-results/task05-review-before.xml` | 1 | 4 failed / 105 deselected；修改前复现 |
+| 调度接口与 Eq.14 修改后的公式/事件 oracle 最窄组合 | 0 | 61 passed / 44 deselected |
+| version 3 fixture 与核心修正后的两份算法单测 | 0 | 150 passed |
+| `python -m pytest tests/unit/test_estimators.py -q --device cpu -k 'raw_byte_samples or layer_inventory_is_copied' --tb=short --junitxml=artifacts/test-results/task05-review-input-before.xml` | 1 | 4 failed / 105 deselected；修改前复现 |
+| 补充输入修正后的 `python -m pytest tests/unit/test_estimators.py -q --device cpu --tb=short` | 0 | 109 passed |
+| `python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/integration/test_profile_estimator.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task05-review-cpu.xml` | 1 | 161 passed / 3 errors / 0 failures / 0 skipped |
+| `python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task05-review-profiler.xml` | 1 | 62 passed / 16 errors / 0 failures / 0 skipped |
+| `python -m pytest tests -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task05-review-regression.xml` | 1 | 421 passed / 89 errors / 0 failures / 0 skipped；510 tests |
+| `python -m compileall -q src tests`；`git diff --check` | 0 | 通过 |
+
+- 本机仍为 Windows / Python 3.13.12 / pytest 9.1.1，无 torch；CPU 模式，没有 backend/worker/GPU/kill 启动。没有安装或改动环境、访问服务器。真实新采样逻辑、数值保持、hook 清理与 CPU profile 接入必须在有 torch 的环境执行，不能视为 CPU 验收完成。
+- 三份最终 JUnit 的 errors 全部为 `No module named 'torch'`，已逐项核对；日志与 XML 同 basename，位于 `artifacts/test-results/`。新增复现记录为 `task05-review-before.log/.xml`、`task05-review-input-before.log/.xml`，汇总为 `task05-review-local-summary.json`。
+- 最终审阅全部相关文件及差异，确认旧累计/平均激活路径、任意队列接口、独立梯度内存参数和旧 schema 解析均已删除。服务器从项目工作目录执行以下组合 CPU 验收；因修改 Profiler，GPU profiling 仍须按前文 Task04 合同验证。
+
+```bash
+python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/integration/test_profile_estimator.py -q --device cpu --junitxml=artifacts/test-results/task05-review-server-cpu.xml
 ```
 
 ## 每次完成小功能的记录格式

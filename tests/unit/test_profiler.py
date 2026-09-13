@@ -160,19 +160,24 @@ def test_saved_activation_bytes_match_independent_autograd_inventory(training, t
     saved_sizes = []
     def pack(tensor):
         if tensor.untyped_storage().data_ptr() not in persistent:
-            saved_sizes.append(tensor.numel() * tensor.element_size())
+            saved_sizes[-1].append(tensor.numel() * tensor.element_size())
         return tensor.detach()
     optimizer.zero_grad(set_to_none=True)
     ids = next_sample_ids(state)
     with torch_module.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         for offset in range(0, len(ids), model.config.micro_batch_size):
+            saved_sizes.append([])
             batch = make_batch(ids[offset:offset + model.config.micro_batch_size], model.config,
                                device=next(model.parameters()).device)
             micro_batch_loss_sum(model(batch.inputs), batch.targets).backward()
     profiler = Profiler(model, optimizer)
     train_profile_step(model, optimizer, state, profiler=profiler)
-    actual = profiler.snapshot()["steps"][0]["memory"]["saved_activation_bytes"]
-    assert sum(actual.values()) == sum(saved_sizes)
+    snapshot = profiler.snapshot()
+    actual = snapshot["steps"][0]["memory"]["saved_activation_bytes"]
+    series = {name: snapshot["metrics"][f"modules.{name}.saved_activation_bytes"]["samples"] for name in actual}
+    assert [sum(samples[mb] for samples in series.values()) for mb in range(3)] == list(map(sum, saved_sizes))
+    assert actual == {name: max(samples) for name, samples in series.items()}
+    assert sum(saved_sizes[-1]) < max(map(sum, saved_sizes))
     assert all(size > 0 for size in actual.values())
 
 
@@ -183,7 +188,7 @@ def test_repeated_steps_release_hooks_and_events(training, torch_module, device)
     allocated = []
     for _ in range(6):
         state, _ = train_profile_step(model, optimizer, state, profiler=profiler)
-        assert not profiler._active and not profiler._pending and not profiler._trace
+        assert not profiler._active and not profiler._pending and not profiler._trace and not profiler._saved
         for module in model.modules():
             assert not module._forward_hooks and not module._forward_pre_hooks and not module._backward_hooks
         for parameter in model.parameters():

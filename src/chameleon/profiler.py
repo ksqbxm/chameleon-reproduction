@@ -11,9 +11,10 @@ import platform
 import time
 
 from .contracts import _finite, _integer
+from .schedule import build_1f1b_schedule
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Measurements:
@@ -58,7 +59,7 @@ def profile_identity(model, *, dp_size: int = 1, pp_size: int = 1, rank: int = 0
     for entry in parameter_inventory(model):
         module_bytes[entry.module_id] = module_bytes.get(entry.module_id, 0) + entry.nbytes
     return {"model_hash": _hash(architecture), "config_hash": _hash(asdict(model.config)),
-            "module_parameter_bytes": module_bytes,
+            "module_parameter_bytes": module_bytes, "module_order": list(module_bytes),
             "device": device_identity(device),
             "parallel": {"dp_size": dp_size, "pp_size": pp_size, "rank": rank}}
 
@@ -163,6 +164,8 @@ class Profiler:
             raise ValueError("duplicate profiling operation")
         self._operation = kind, key
         self._executed[kind, key] = set()
+        if kind == "forward":
+            self._saved[key] = dict.fromkeys((*self.identity["module_order"], "loss_and_runtime"), 0)
         try:
             start = self._stamp()
             yield
@@ -245,15 +248,16 @@ class Profiler:
             torch.cuda.reset_peak_memory_stats(self.device)
         self._pending, self._trace, self._values, self._activation = [], [], [], {}
         self._operation, self._executed = None, {}
-        saved_bytes = dict.fromkeys((*inventory, "loss_and_runtime"), 0)
+        self._saved = {}
         persistent_storage = {t.untyped_storage().data_ptr()
                               for t in (*self.model.parameters(), *self.model.buffers())}
 
         def pack(tensor):
             # Logical bytes per saved tensor occurrence (aliases may repeat), not physical HBM.
             if tensor.untyped_storage().data_ptr() not in persistent_storage:
+                key = self._operation_key("forward")
                 name = next(reversed(forward_starts)) if forward_starts else "loss_and_runtime"
-                saved_bytes[name] += tensor.numel() * tensor.element_size()
+                self._saved[key][name] += tensor.numel() * tensor.element_size()
             return tensor.detach()
 
         handles = []
@@ -276,7 +280,8 @@ class Profiler:
             memory = {"kind": "cuda_hbm" if self.device.type == "cuda" else "logical_tensor_bytes",
                       "modules": tensor_inventory(self.model, self.optimizer),
                       "output_activation_bytes": dict(self._activation),
-                      "saved_activation_bytes": saved_bytes,
+                      "saved_activation_bytes": {name: max(row[name] for row in self._saved.values())
+                                                 for name in (*inventory, "loss_and_runtime")},
                       "peak_allocated_bytes": None, "peak_reserved_bytes": None}
             if self.device.type == "cuda":
                 memory.update(peak_allocated_bytes=torch.cuda.max_memory_allocated(self.device),
@@ -298,8 +303,9 @@ class Profiler:
             for name, row in memory["modules"].items():
                 for kind, size in row.items():
                     self.measurements.add(f"modules.{name}.{kind}", size)
-            for name, size in saved_bytes.items():
-                self.measurements.add(f"modules.{name}.saved_activation_bytes", size)
+            for row in self._saved.values():
+                for name, size in row.items():
+                    self.measurements.add(f"modules.{name}.saved_activation_bytes", size)
             for key in ("peak_allocated_bytes", "peak_reserved_bytes"):
                 if memory[key] is not None:
                     self.measurements.add(key, memory[key])
@@ -311,6 +317,7 @@ class Profiler:
             self._operation, self._executed = None, {}
             # CUDA events are transient; no activation or gradient tensors are retained.
             self._pending, self._trace, self._values, self._activation = [], [], [], {}
+            self._saved = {}
 
     def add_calibration(self, report: dict) -> None:
         from .transfer_calibration import validate_calibration
@@ -372,16 +379,14 @@ def _validate_trace(trace, parallel):
     for (_, stage), operations in stages.items():
         forwards = [r["micro_batch"] for r in operations if r["kind"] == "forward"]
         backwards = [r["micro_batch"] for r in operations if r["kind"] == "backward"]
-        warmup = min(parallel["pp_size"] - stage - 1, len(forwards))
-        expected = ([("forward", "warmup")] * warmup
-                    + [("forward", "steady"), ("backward", "steady")] * (len(forwards) - warmup)
-                    + [("backward", "cooldown")] * warmup)
+        queue = build_1f1b_schedule(parallel["pp_size"], len(forwards))[stage]
+        expected = [(op.kind, op.phase) for op in queue]
         if forwards != backwards or [(r["kind"], r["phase"]) for r in operations] != expected:
             raise ValueError("trace must follow actual 1F1B warmup/steady/cooldown order")
 
 
 def _validate_identity(identity):
-    _keys(identity, ("model_hash", "config_hash", "module_parameter_bytes", "device", "parallel"), "identity")
+    _keys(identity, ("model_hash", "config_hash", "module_parameter_bytes", "module_order", "device", "parallel"), "identity")
     for name in ("model_hash", "config_hash"):
         value = identity[name]
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
@@ -393,6 +398,10 @@ def _validate_identity(identity):
         if not isinstance(name, str) or not name:
             raise ValueError("invalid module name")
         _integer("module parameter bytes", size)
+    order = identity["module_order"]
+    if (not isinstance(order, list) or any(not isinstance(name, str) for name in order)
+            or len(order) != len(module_bytes) or set(order) != set(module_bytes)):
+        raise ValueError("invalid identity module order")
     _validate_device_identity(identity["device"])
     parallel = identity["parallel"]
     _keys(parallel, ("dp_size", "pp_size", "rank"), "parallel configuration")
@@ -513,16 +522,21 @@ def _validate_module_samples(payload):
     steps, metrics = payload["steps"], payload["metrics"]
     forward_count = sum(r["kind"] == "forward" for step in steps for r in step["trace"])
     modules = payload["identity"]["module_parameter_bytes"]
-    sizes = ("parameter_bytes", "gradient_bytes", "adamw_bytes", "saved_activation_bytes")
+    sizes = ("parameter_bytes", "gradient_bytes", "adamw_bytes")
     for module in modules:
-        for field in (*sizes, "forward_s", "backward_s", "output_activation_bytes"):
+        for field in (*sizes, "forward_s", "backward_s", "output_activation_bytes", "saved_activation_bytes"):
             name = f"modules.{module}.{field}"
             expected_count = len(steps) if field in sizes else forward_count
             if name not in metrics or len(metrics[name]["samples"]) != expected_count:
                 raise ValueError("missing module measurement samples")
+            if field.endswith("_bytes"):
+                for value in metrics[name]["samples"]:
+                    _integer("byte sample", value, 0)
     runtime = "modules.loss_and_runtime.saved_activation_bytes"
-    if runtime not in metrics or len(metrics[runtime]["samples"]) != len(steps):
+    if runtime not in metrics or len(metrics[runtime]["samples"]) != forward_count:
         raise ValueError("missing runtime activation samples")
+    for value in metrics[runtime]["samples"]:
+        _integer("byte sample", value, 0)
     peaks = ("peak_allocated_bytes", "peak_reserved_bytes") if payload["identity"]["device"]["type"] == "cuda" else ()
     for name in peaks:
         if name not in metrics or len(metrics[name]["samples"]) != len(steps):
@@ -544,14 +558,14 @@ def _validate_module_samples(payload):
                 raise ValueError("CUDA peak samples differ from memory inventory")
         for module in modules:
             for field in sizes:
-                expected = (memory["saved_activation_bytes"][module] if field == "saved_activation_bytes"
-                            else memory["modules"][module][field])
+                expected = memory["modules"][module][field]
                 if metrics[f"modules.{module}.{field}"]["samples"][index] != expected:
                     raise ValueError("memory samples differ from module inventory")
-            samples = metrics[f"modules.{module}.output_activation_bytes"]["samples"][offset:offset + count]
-            if max(samples) != memory["output_activation_bytes"][module]:
-                raise ValueError("output activation samples differ from module inventory")
-        if metrics[runtime]["samples"][index] != memory["saved_activation_bytes"]["loss_and_runtime"]:
+            for field in ("output_activation_bytes", "saved_activation_bytes"):
+                samples = metrics[f"modules.{module}.{field}"]["samples"][offset:offset + count]
+                if max(samples) != memory[field][module]:
+                    raise ValueError("activation samples differ from module inventory")
+        if max(metrics[runtime]["samples"][offset:offset + count]) != memory["saved_activation_bytes"]["loss_and_runtime"]:
             raise ValueError("runtime activation samples differ from inventory")
         offset += count
 
@@ -584,14 +598,19 @@ def train_profile_step(model, optimizer, state, *, profiler: Profiler | None = N
     ids = next_sample_ids(state)
     device = next(model.parameters()).device
     losses = []
+    queue = build_1f1b_schedule(1, (len(ids) + model.config.micro_batch_size - 1)
+                              // model.config.micro_batch_size)[0]
     with profiler.step(step_id) if profiler is not None else nullcontext():
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        for micro_batch, offset in enumerate(range(0, len(ids), model.config.micro_batch_size)):
+        for forward, backward in zip(queue[::2], queue[1::2]):
+            offset = forward.micro_batch * model.config.micro_batch_size
             batch = make_batch(ids[offset:offset + model.config.micro_batch_size], model.config, device=device)
-            with profiler.operation("forward", micro_batch) if profiler is not None else nullcontext():
+            with (profiler.operation(forward.kind, forward.micro_batch, phase=forward.phase)
+                  if profiler is not None else nullcontext()):
                 loss = micro_batch_loss_sum(model(batch.inputs), batch.targets)
-            with profiler.operation("backward", micro_batch) if profiler is not None else nullcontext():
+            with (profiler.operation(backward.kind, backward.micro_batch, phase=backward.phase)
+                  if profiler is not None else nullcontext()):
                 loss.backward()
             losses.append(loss.detach())
         for parameter in model.parameters():

@@ -1,6 +1,6 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现。本机无需 torch 的单测已通过，训练数值测试因缺少 torch 尚未执行成功；真实 CPU/Gloo、服务器 GPU/NCCL 和恢复验收仍待执行。按用户要求，GPU 测试由用户在服务器启动，本机不继续执行 GPU 测试。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现。本机无需 torch 的单测已通过，训练数值测试因缺少 torch 尚未执行成功；真实 CPU/Gloo、服务器 GPU/NCCL 和恢复验收仍待执行。真实 GPU 验收由用户在服务器启动；本次按用户最新要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出，未执行 GPU 测试。用户回传 Task 03 CUDA 70 passed / 1 failed，浮点精确比较断言已修正，待服务器重跑。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
 
 ## 状态
 
@@ -8,8 +8,9 @@
 | --- | --- | --- |
 | 01 | 已修正 NCCL 元数据判断；非 torch 合同已验；真实 CPU/GPU 待验 | 最新全量回归中 84 passed / 13 errors；9 项新增元数据测试及 4 项真实 smoke 因缺少 torch 报错；GPU 未执行 |
 | 02 | 已修正 optimizer 完成与 commit 的时序；非 torch 单测已验；CPU/GPU 数值待验 | 最新全量回归中 17 passed / 15 errors；训练/模型测试因缺少 torch 报错；GPU 未执行 |
-| 03 | 已替换 owner 清单接口和存储重叠检查；ID/清单单测已验；CPU/GPU 数值待验 | 最新 Task 03 组合 32 passed / 39 errors；完整回归 133 passed / 67 errors；错误全部为缺少 torch；GPU 未执行 |
-| 04-15 | 待实施 | 未执行 |
+| 03 | owner 清单/重叠检查已实现；CUDA 浮点断言已修正；待服务器重跑验收 | 用户回传 CUDA 70 passed / 1 failed；修正后本机 CPU 32 passed / 39 errors，CUDA 配置阶段退出，均因缺少 torch |
+| 04 | 已修正 trace/JSON 完备性及 hook 生命周期；唯一 profile v2；CPU/GPU 实测待验 | 最新 task04：99 passed / 19 errors；全仓回归 232 passed / 86 errors；全部 errors 为缺少 torch；GPU 未执行 |
+| 05-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -185,6 +186,83 @@ python -m pytest tests/integration/test_environment.py -q --device cuda --world-
 ```
 
 第二条验证单 GPU 模型与数学对照，第三条单独验证真实双 GPU 环境与清理，不以单 GPU 替代双 GPU 要求。用户回传实际完整日志/XML 后更新验收状态。
+
+## Task 03 CUDA 标量容差测试修正（2026-09-13）
+
+- 用户回传服务器 Task 03 CUDA 日志：71 tests，70 passed / 1 failed / 1 warning；唯一失败为 `0.7000000000000001 == 0.7` 的精确浮点比较。此为用户提供的服务器结果，不是本机执行结果。
+- 仅修改 `tests/unit/test_global_loss.py::test_owner_sum_divides_once_and_includes_endpoint_names` 的三个端点标量断言，统一使用 `pytest.approx` 和已有 `tolerance` 的 rtol/atol；CPU 1e-8/1e-10、CUDA 1e-7/1e-9 保持不变。实现代码、其他测试语义和 requires-grad scalar warning 均未修改，无兼容路径或新依赖。
+- 实际重跑 CPU：`python -m pytest tests/unit/test_global_loss.py tests/integration/test_partitioned_gradient_oracle.py -q --device cpu --junitxml=artifacts/test-results/task03-scalar-tolerance-cpu.xml`；退出码 1，32 passed / 39 errors / 0 failures / 0 skipped，全部 errors 为缺少 torch 的 fixture 导入错误。
+- 实际重跑 CUDA：`python -m pytest tests/unit/test_global_loss.py tests/integration/test_partitioned_gradient_oracle.py -q --device cuda --world-size 1 --require-gpu --junitxml=artifacts/test-results/task03-scalar-tolerance-gpu.xml`；退出码 4，配置阶段报 `No module named 'torch'`，未运行 tests/GPU，也未生成 CUDA XML。最新用户重跑要求覆盖此前不再尝试本机 CUDA 命令的偏好；未安装或改变本机环境、未访问服务器。
+- 标准库 AST 语法检查及直接 `pytest.approx` 检查成功：CPU/CUDA 两套既有容差均接受用户提供的 0.7000000000000001，同时拒绝 0.701。该检查不代表 Tensor CPU/GPU 数值测试通过。实际 CPU XML 已解析核对，日志保存为上述报告同 basename 的 `.log`；CUDA 仅有 `.log`。
+- 最终复核：测试函数仅三个 `==` 标量断言替换为带原容差的 `pytest.approx`，生产实现未修改；未启动 worker，无 PID/端口/rendezvous 或 kill 审计。修复后的 CPU/GPU 数值仍待服务器执行，不将 Task 03 标记验收完成。
+- 服务器重跑沿用 `task03-server-cpu.xml` / `task03-server-gpu.xml` 命令（见 Task 03 实现章节），运行对象仍为 `tests/unit/test_global_loss.py tests/integration/test_partitioned_gradient_oracle.py`；CUDA 必须保留 `--world-size 1 --require-gpu`。
+
+## Task 04 实现与开发验证（2026-09-13）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task 04/05 和前置模型、data、reference、loss、environment 代码；未发现额外仓库 AGENTS.md，遵循用户提供的全局规则。按用户要求实现 Task 04，前置 task 的服务器验收状态保持原记录。
+- 本次修改范围：新增 `src/chameleon/profiler.py`、`transfer_calibration.py`、`tests/unit/test_profiler.py`、`tests/integration/test_profile_roundtrip.py`、`tests/distributed/test_transfer_calibration.py`，以及本进度文件。保留工作区已有的 Task 03 标量容差测试和进度修改；没有修改其他实现、依赖或容器环境。
+- Profiler：每个 trainable 模块采集 forward 时间；从模块真实 forward 的 autograd 图识别新增节点，用节点 pre/post hooks 累计该模块的 backward execution time，包含整数输入的 embedding backward。CPU 使用 monotonic clock，CUDA 记录真实 events 并在同步后读取。保存实际 step 时间、wall 时间、parallel configuration、原始样本和 EMA；事件和 hooks 在每次采样 finally 中释放。
+- 内存：从完整 `parameter_inventory` 按模块统计 parameter、当前 gradient 和 AdamW tensor bytes，包含端点及新增 trainable 参数。必须先执行真实 warmup，使全部 AdamW step/exp_avg/exp_avg_sq materialize；不以初始化状态填充。CPU 明确记录 `logical_tensor_bytes`，HBM peak 为 null；CUDA 实测 peak allocated/reserved。
+- activation：`output_activation_bytes` 是每模块当前 step 中最大的输出张量逻辑大小，原始样本仍保留每次 forward 的大小；`saved_activation_bytes` 是当前 step autograd 实际保存的非参数/非 buffer 张量的逻辑字节总量，按保存发生的模块归属统计，loss/runtime 单独列出。同一存储的重复保存可重复计数，这不是物理占用或 live activation peak；物理 HBM 使用 CUDA allocator 实测。
+- trace：`train_profile_step` 真实执行单 worker、单 stage 的 F0/B0/F1/B1，保留不等大小末尾 micro-batch，梯度仅除一次 global sample count；optimizer 完成、CUDA 标量等待和 profiling 成功返回后才 commit。`Profiler.step/operation` 提供后续 runtime 的真实操作记录入口。本 task 未实现或声称执行多 stage 分布式 PP；操作依赖与多 stage runtime 仍属 Task 05/09。
+- 通信校准：两个真实 spawn workers 绑定 CPU/Gloo 或不同 CUDA/NCCL device，预热后双向 send/recv 多种 FP64 tensor size 并验证内容。分别记录 execution/wall time；bootstrap 记录真实 rendezvous、init 和首次 barrier/CUDA 同步，包含 NCCL lazy communicator 初始化，不包含 group shutdown。所有原始校准样本可加入 Profiler 的 EMA 聚合。`transfer_time_s` 使用较慢端点的样本均值；未测边或大小明确报缺数据，不填任意带宽。
+- 每次多进程校准有父进程硬超时，finally terminate/join/kill、进程组销毁和 PID/exitcode、TCP port、临时 rendezvous 目录审计；异常、超时或清理失败抛 `CalibrationError` 并保存审计报告。测试包含真实正常传输和硬超时清理；本机缺 torch，尚未实际 spawn 或验证这些审计。
+- JSON：只在显式 `export_profile` 时写盘，`load_profile` 校验 version、字段、模型结构 hash、config hash、dtype/device/hardware/torch identity、parallel configuration、原始样本/EMA、trace 和 memory 结构。不保存参数值或 optimizer state，不作为恢复 checkpoint，不采集或预测 D/MTBF。schema fixtures 只用于结构/独立手算测试，不替代真实 profiling 或传输。
+- 本机：Windows / Python 3.13.12 / pytest 9.1.1，无 torch。未安装、升级、降级依赖，未访问服务器，未执行 CUDA 命令；这些本机结果不替代目标容器合同或 GPU 验收。
+
+实际运行记录（退出码非 0 的测试不记为验收通过）：
+
+| 小功能 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| EMA 最窄单测：`python -m pytest tests/unit/test_profiler.py -q --device cpu -k 'raw_samples or invalid_ema or invalid_measurements'` | 0 | 11 passed / 7 deselected |
+| 初版真实计时/内存单测：`python -m pytest tests/unit/test_profiler.py -q --device cpu` | 1 | 11 passed / 7 errors，均缺 torch；后续增加 saved activation 独立 inventory 测试 |
+| 初版 JSON：`python -m pytest tests/integration/test_profile_roundtrip.py -q --device cpu` | 1 | 28 passed / 6 errors；5 项默认 pytest 临时目录访问拒绝，1 项缺 torch |
+| 临时目录改为项目相对 artifacts 配置后，同一 JSON 命令 | 1 | 33 passed / 1 error；仅真实 profile fixture 缺 torch，文件读写和 JSON 校验已通过 |
+| 初版双 rank 校准：`python -m pytest tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2` | 1 | 27 passed / 2 errors；真实 spawn fixtures 缺 torch |
+| Task 04 必需 CPU 组合：`python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --junitxml=artifacts/test-results/task04-cpu.xml` | 1 | 44 passed / 9 errors / 0 failures / 0 skipped；53 tests，全部 errors 缺 torch |
+| Task 04 必需 CPU 通信：`python -m pytest tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task04-transfer-cpu.xml` | 1 | 27 passed / 2 errors / 0 failures / 0 skipped；29 tests，全部 errors 缺 torch |
+| 最终全仓组合：`python -m pytest tests -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task04-regression.xml` | 1 | 204 passed / 78 errors / 0 failures / 0 skipped；282 tests，全部 errors 缺 torch |
+| Task 04 三文件 `--collect-only -q --device cpu` | 0 | 82 tests collected；不代表执行通过 |
+| `python -m compileall -q src tests`；新增文件 AST/空白检查 | 0 | 语法和空白检查通过；不代表 torch API 或数值验证通过 |
+
+- 三份 JUnit 已通过标准库 XML parser 核对数量和逐项错误，所有 errors 均含 `No module named 'torch'`。实际日志与 XML 同 basename，位于 `artifacts/test-results/`；另有 `task04-collection.log`、`task04-local-summary.json` 和新增文件审阅 diff `task04-new-files.diff`。
+- 未验证项：真实 forward/backward 和 CUDA events、独立 parameter/gradient/AdamW/saved activation inventory、profiling 前后数值一致性、重复采样 HBM 无泄漏、真实双 rank P2P/bootstrap 和超时清理，均待有 torch 的环境执行。当前不能标“CPU 已验，GPU 待验”，也不能标 Task 04 完成。
+- 下一项依赖：Task 05 读取本 task 的真实模块时间、逻辑内存及 trace；本次没有提前实现 Estimator 或 schedule。
+
+服务器验收命令（从项目工作目录运行，使用总计划指定的既有 python，无需安装项目或依赖）：
+
+```bash
+python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --junitxml=artifacts/test-results/task04-server-cpu.xml
+python -m pytest tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task04-server-transfer-cpu.xml
+python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/distributed/test_transfer_calibration.py -q --device cuda --world-size 2 --require-gpu --junitxml=artifacts/test-results/task04-server-gpu.xml
+```
+
+第三条必须真实双 GPU/NCCL，设备不足或环境不匹配直接失败；用户回传完整日志/XML 与校准审计后，再确认 CPU/GPU 验收状态。
+
+## Task 04 审阅与优化（2026-09-13）
+
+- 按用户要求审查正确性、完备性和简洁性，重新核对 `CLAUDE.md`、总计划、Task 04 及相关代码。修改仅涉及两个 task04 实现、三个对应测试文件和本进度文件；保留工作区已有 Task 03 修改，没有修改依赖或环境。
+- 实际先写回归测试并复现 18 个失败实例：初次 trace/step/parameter 校验 3 failed，通信 schema/输入 9 failed / 26 passed，补充 module timing/CUDA peak 2 failed，CPU HBM metrics 2 failed，rank/PID 非标量输入 2 failed / 19 passed。修正后这些非 torch 回归测试全部通过；新增真实 torch/worker 回归仍因环境缺 torch 未执行到断言。
+- 正确性：旧 trace 仅检查 F/B 配对，允许单 stage F0/F1/B0/B1。现在逐 pipeline/stage 检查真实 1F1B warmup/steady/cooldown 次序、FIFO micro-batch 和 trace 时间边界；warmup 为 min(pp_size-stage-1, Nm)。拒绝 trace 超出实测 step 时间，以及模块执行时间总和超出其真实 operation 时段。独立手写 oracle 覆盖 PP=2、PP=4 且 Nm 少于 stages 的 phase 校验，不宣称已执行多 stage PP runtime。
+- 实际操作关联：forward/backward 必须处于正确 scope，每个 operation 必须执行该 worker 的全部 trainable 模块；拒绝嵌套 scope、重复操作和空 backward。非参数 autograd 节点绑定创建它的真实 forward micro-batch，backward 标签必须匹配；可跨 micro-batch 复用的 AccumulateGrad 仍计时，但不能作为当前 forward 图已经 backward 的证据。删除旧 `_backward_id` 状态，仅保留当前 operation 状态和实际模块执行清单。
+- 完备性：profile 唯一格式升级为 version 2，identity 加入模块 parameter bytes 清单，加载时核对全部模块及其 parameter bytes、forward/backward/activation/optimizer 原始样本数量、memory 与原始样本一致性，以及 CUDA peak 样本；CPU 禁止出现 HBM metrics。模型 hash 纳入模块 `extra_repr`，可检测例如实际 LayerNorm eps 改变；设备检查覆盖 buffers，未指定 index 的 CUDA device 显式解析为当前设备。version 1 文件直接拒绝，需要重新导出，没有旧格式解析或迁移分支。
+- 资源生命周期：hook 注册和初始时间戳创建均移入同一个 try/finally，逐项登记 handles，途中失败也会移除已注册 hooks，并清空当前 operation/events 状态。测试覆盖 hook 注册途中失败、初始时间戳失败、后续重新采样和嵌套 scope 拒绝后外层仍能完成；本机尚未实际执行这些 torch 路径。
+- 校准：共享唯一 tensor size 校验，先核验整数/FP64 字节边界再去重，避免非法嵌套数据触发 TypeError；lookup 不再把 bool/float 当作 rank 或字节 identity。rank/PID 的字段和整数校验移到聚合/去重前；核验 bootstrap 是 list、worker PID/exitcode/布尔状态及两个 rank 的执行环境一致性。父进程在完成判断前检查硬 deadline，避免超时后完成的 worker 被记为成功；保留现有 terminate/join/kill 和 PID/port/rendezvous 审计。新增真实 spawn 的 worker 异常测试，worker 在通信前抛错，不替换 collective/P2P。
+- 简洁性：删除被替代的 scope 状态和宽松校验；复用 size 校验，合并重复的 CPU/CUDA event 测试 setup/body，设备差异只留在类型/同步断言中。没有新增兼容 adapter、默认 timing/bandwidth、恢复初始化或额外进度文档。
+- 本机仍为 Windows / Python 3.13.12 / pytest 9.1.1，无 torch；未安装或改变环境，未访问服务器，未执行 CUDA 命令。CPU/GPU FP64 数值容差保持原值，未静默放宽。
+
+实际最终验证：
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task04-review-cpu.xml` | 1 | 61 passed / 16 errors / 0 failures / 0 skipped |
+| `python -m pytest tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task04-review-transfer-cpu.xml` | 1 | 38 passed / 3 errors / 0 failures / 0 skipped |
+| `python -m pytest tests -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task04-review-regression.xml` | 1 | 232 passed / 86 errors / 0 failures / 0 skipped；318 tests |
+| Task 04 三文件 `--collect-only -q --device cpu` | 0 | 118 tests collected，比审阅前增加 36 项 |
+| `python -m compileall -q src tests`；修改文件 AST/空白检查 | 0 | 通过，不代表 torch API 或数值验证通过 |
+
+- 三份 XML 已核对：77/41/318 tests，16/3/86 errors，全部错误含 `No module named 'torch'`。实际完整日志与 XML 同 basename；另有 `artifacts/test-results/task04-review-collection.log`、`task04-review-local-summary.json` 和本次审阅 diff `task04-review.diff`。修改前快照只用于差异审阅，位于忽略的 artifacts 中，不是可执行旧实现或兼容路径。
+- 当前 task04 合计 99 passed / 19 errors。真实 torch 计时、数值、inventory、CUDA HBM、双 rank 校准和异常/超时清理未验证，本机没有启动 worker，不能将 CPU/GPU 验收标通过。服务器沿用上节三条验收命令，运行当前 version 2 实现并回传完整日志/XML/审计后再更新状态。
 
 ## 每次完成小功能的记录格式
 

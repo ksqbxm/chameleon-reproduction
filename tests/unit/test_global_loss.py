@@ -152,9 +152,12 @@ def test_owner_sum_divides_once_and_includes_endpoint_names(torch_module, device
         torch.testing.assert_close(owner["embedding.weight"],
                                    torch.tensor([9.4, 18.8], dtype=torch.float64, device=device),
                                    **tolerance)
-    assert owners["owner0"]["blocks.0.weight"].item() == 2
-    assert owners["owner1"]["final_norm.bias"].item() == 0.5
-    assert owners["owner2"]["lm_head.weight"].item() == 0.7
+    assert owners["owner0"]["blocks.0.weight"].item() == pytest.approx(
+        2., rel=tolerance["rtol"], abs=tolerance["atol"])
+    assert owners["owner1"]["final_norm.bias"].item() == pytest.approx(
+        0.5, rel=tolerance["rtol"], abs=tolerance["atol"])
+    assert owners["owner2"]["lm_head.weight"].item() == pytest.approx(
+        0.7, rel=tolerance["rtol"], abs=tolerance["atol"])
     before = owners["owner0"]["embedding.weight"].clone()
     with pytest.raises(ValueError, match="already normalized"):
         ledger.sum_and_normalize_gradients_(owners)

@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import platform
+import re
 import socket
 import sys
 import tempfile
@@ -74,11 +75,17 @@ def validate_container(report: dict) -> None:
     """Check the fixed server contract without modifying its environment."""
     expected = {
         "system": "Linux", "python": "3.12.3", "executable": "/usr/bin/python",
-        "cwd": "/workspace", "torch": "2.8.0a0+5228986",
+        "cwd": "/workspace",
         "cuda": "12.9", "nccl": "2.27.3", "visible_gpu_count": 8,
     }
     errors = [f"{key}: expected {value!r}, got {report.get(key)!r}"
               for key, value in expected.items() if report.get(key) != value]
+    # NGC expands the Git revision and appends its container release to torch's version.
+    torch_version = report.get("torch")
+    if (not isinstance(torch_version, str)
+            or not re.fullmatch(r"2\.8\.0a0\+5228986[0-9a-f]*(?:\.nv25\.06)?", torch_version)):
+        errors.append(f"torch: expected 2.8.0a0+5228986 with optional NGC 25.06 metadata, "
+                      f"got {torch_version!r}")
     release = report.get("os_release", {})
     if release.get("ID") != "ubuntu" or release.get("VERSION_ID") != "24.04":
         errors.append("OS must be Ubuntu 24.04")
@@ -87,9 +94,12 @@ def validate_container(report: dict) -> None:
             errors.append(f"{name}: expected {version}, got "
                           f"{report.get('packages', {}).get(name)!r}")
     # torch.version.cuda exposes major.minor only, so verify the toolkit patch separately.
-    # The caller supplies CUDA_VERSION from the NVIDIA container, when available.
-    if report.get("container_cuda_version") != "12.9.1":
-        errors.append("container CUDA_VERSION must be 12.9.1")
+    # NGC's CUDA_VERSION may append a numeric toolkit build to major.minor.patch.
+    cuda_version = report.get("container_cuda_version")
+    if (not isinstance(cuda_version, str)
+            or not re.fullmatch(r"12\.9\.1(?:\.[0-9]+)?", cuda_version)):
+        errors.append(f"container_cuda_version: expected 12.9.1 with optional numeric build, "
+                      f"got {cuda_version!r}")
     if errors:
         raise RuntimeError("Container contract mismatch:\n" + "\n".join(errors))
 

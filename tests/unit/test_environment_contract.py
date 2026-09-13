@@ -26,7 +26,8 @@ def container_metadata():
     return {
         "system": "Linux", "os_release": {"ID": "ubuntu", "VERSION_ID": "24.04"},
         "python": "3.12.3", "executable": "/usr/bin/python", "cwd": "/workspace",
-        "torch": "2.8.0a0+5228986", "cuda": "12.9", "container_cuda_version": "12.9.1",
+        "torch": "2.8.0a0+5228986c39.nv25.06", "cuda": "12.9",
+        "container_cuda_version": "12.9.1.010",
         "nccl": "2.27.3", "visible_gpu_count": 8,
         "packages": {"numpy": "1.26.4", "scipy": "1.15.3", "pandas": "2.2.3",
                      "networkx": "3.5", "PuLP": "3.2.1", "matplotlib": "3.10.3",
@@ -55,11 +56,46 @@ def test_reject_missing_or_changed_package(name):
         validate_container(report)
 
 
-def test_valid_container_check_does_not_mutate_metadata():
+@pytest.mark.parametrize("torch_version", [
+    "2.8.0a0+5228986", "2.8.0a0+5228986c39",
+    "2.8.0a0+5228986.nv25.06", "2.8.0a0+5228986c39.nv25.06",
+])
+@pytest.mark.parametrize("cuda_version", ["12.9.1", "12.9.1.010"])
+def test_valid_container_check_does_not_mutate_metadata(torch_version, cuda_version):
     report = container_metadata()
+    report["torch"] = torch_version
+    report["container_cuda_version"] = cuda_version
     before = deepcopy(report)
     validate_container(report)
     assert report == before
+
+
+@pytest.mark.parametrize("key,value", [
+    ("torch", None), ("torch", 2.8),
+    ("torch", "2.9.0a0+5228986c39.nv25.06"),
+    ("torch", "2.8.0a1+5228986c39.nv25.06"),
+    ("torch", "2.8.0+5228986c39.nv25.06"),
+    ("torch", "2.8.0a0+5228987c39.nv25.06"),
+    ("torch", "2.8.0a0+5228986g39.nv25.06"),
+    ("torch", "2.8.0a0+5228986c39.nv25.05"),
+    ("torch", "2.8.0a0+5228986c39.nv25.060"),
+    ("torch", "2.8.0a0+5228986c39.nv25.06.extra"),
+    ("torch", "2.8.0a0+5228986c39.nv25.06\n"),
+    ("container_cuda_version", 12.9),
+    ("container_cuda_version", "12.9"),
+    ("container_cuda_version", "12.9.10"),
+    ("container_cuda_version", "12.9.2.010"),
+    ("container_cuda_version", "12.8.1.010"),
+    ("container_cuda_version", "12.9.1."),
+    ("container_cuda_version", "12.9.1.010.1"),
+    ("container_cuda_version", "12.9.1.abc"),
+    ("container_cuda_version", "12.9.1.010\n"),
+])
+def test_reject_ngc_base_version_or_build_mismatch(key, value):
+    report = container_metadata()
+    report[key] = value
+    with pytest.raises(RuntimeError, match=key):
+        validate_container(report)
 
 
 @pytest.fixture

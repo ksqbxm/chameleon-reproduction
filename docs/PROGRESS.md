@@ -9,7 +9,7 @@
 | 01 | 已修正 NCCL 元数据判断；非 torch 合同已验；真实 CPU/GPU 待验 | 最新全量回归中 84 passed / 13 errors；9 项新增元数据测试及 4 项真实 smoke 因缺少 torch 报错；GPU 未执行 |
 | 02 | 已修正 optimizer 完成与 commit 的时序；非 torch 单测已验；CPU/GPU 数值待验 | 最新全量回归中 17 passed / 15 errors；训练/模型测试因缺少 torch 报错；GPU 未执行 |
 | 03 | owner 清单/重叠检查已实现；CUDA 浮点断言已修正；待服务器重跑验收 | 用户回传 CUDA 70 passed / 1 failed；修正后本机 CPU 32 passed / 39 errors，CUDA 配置阶段退出，均因缺少 torch |
-| 04 | 已修正 trace/JSON 完备性及 hook 生命周期；唯一 profile v2；CPU/GPU 实测待验 | 最新 task04：99 passed / 19 errors；全仓回归 232 passed / 86 errors；全部 errors 为缺少 torch；GPU 未执行 |
+| 04 | 服务器全仓回归通过；NGC 版本表示检查已修正；双 GPU 校准待重跑 | 用户回传全仓 318 passed、Task04 CUDA 115 passed / 3 setup errors（环境合同阻断）；本次合同测试 54 passed；原 CUDA 命令本机因缺 torch 配置阶段退出 |
 | 05-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
@@ -263,6 +263,20 @@ python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roun
 
 - 三份 XML 已核对：77/41/318 tests，16/3/86 errors，全部错误含 `No module named 'torch'`。实际完整日志与 XML 同 basename；另有 `artifacts/test-results/task04-review-collection.log`、`task04-review-local-summary.json` 和本次审阅 diff `task04-review.diff`。修改前快照只用于差异审阅，位于忽略的 artifacts 中，不是可执行旧实现或兼容路径。
 - 当前 task04 合计 99 passed / 19 errors。真实 torch 计时、数值、inventory、CUDA HBM、双 rank 校准和异常/超时清理未验证，本机没有启动 worker，不能将 CPU/GPU 验收标通过。服务器沿用上节三条验收命令，运行当前 version 2 实现并回传完整日志/XML/审计后再更新状态。
+
+## NGC 25.06 环境合同版本表示修正（2026-09-13）
+
+- 用户回传服务器全仓回归 318 passed、Task04 CUDA 115 passed / 3 setup errors，三个分布式测试在 fixture 的 `validate_container()` 阶段被阻断。实际元数据为 torch `2.8.0a0+5228986c39.nv25.06`、torch CUDA `12.9`、NCCL `2.27.3`、容器 CUDA_VERSION `12.9.1.010`。本次按用户要求只修正环境合同、对应单测和本进度记录，没有修改 Task04 逻辑、fixture、依赖或设备检查。上述服务器结果来自用户回传，未在本机重复执行成功。
+- torch 用唯一完整匹配规则核验 `2.8.0a0`、提交前缀 `5228986`，允许十六进制提交号展开及可选 `.nv25.06` 元数据；CUDA_VERSION 用唯一完整匹配规则核验 `12.9.1`，允许末尾一个数字构建号。拒绝错误 base/prerelease、提交前缀、NGC release、CUDA patch 及非数字/多段/多余后缀；没有旧路径 adapter 或跳过合同的开关。Ubuntu、Python、解释器、工作目录、torch CUDA `12.9`、NCCL `2.27.3`、8 GPU 可见性和所有第三方库版本检查保持原值。
+- 对应独立元数据 fixture 改用用户提供的真实版本表示，确保原有系统/依赖不匹配测试不会因 torch/CUDA 表示错误而误通过。新增 27 个测试实例，覆盖 8 组等价表示的通过和元数据不被修改，以及 20 组版本/类型/后缀拒绝；其中 1 个通过实例来自原有测试。
+- 修改实现前运行 `python -m pytest tests/unit/test_environment_contract.py -q --device cpu -k valid_container_check_does_not_mutate_metadata --junitxml=artifacts/test-results/task04-ngc-before.xml`，退出码 1：7 failed / 1 passed / 55 deselected，复现等价表示被拒绝。
+- 修改后运行 `python -m pytest tests/unit/test_environment_contract.py -q --device cpu -k 'not nccl_report and not absent_nccl' --junitxml=artifacts/test-results/task04-ngc-contract.xml`，退出码 0：54 passed / 9 deselected。未选择的 9 项为原有 torch 元数据测试，本机缺 torch；没有修改或跳过服务器 GPU 测试。
+- `python -m compileall -q src/chameleon/environment.py tests/unit/test_environment_contract.py` 和 `git diff --check` 均通过。
+- 按用户要求原样重跑下列 Task04 CUDA 命令，本机退出码 1：`ERROR: No module named 'torch'`。仍为 Windows / Python 3.13.12，无 torch；配置阶段退出，没有测试执行、worker 启动或本次 JUnit 生成。实际输出记录在 `artifacts/test-results/task04-ngc-cuda-local.log`，未安装依赖、切换 CPU 或替换 NCCL。服务器更新代码后仍须原样执行这条命令，才能确认三个分布式测试和清理审计通过：
+
+```bash
+python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/distributed/test_transfer_calibration.py -q --device cuda --world-size 2 --require-gpu --junitxml=artifacts/test-results/task04-server-gpu.xml
+```
 
 ## 每次完成小功能的记录格式
 

@@ -256,3 +256,75 @@ def test_reference_rejects_mismatched_batch_and_multiple_participants(reference)
         ReferenceTrainer(reference.model, cluster(2))
     with pytest.raises(ValueError, match="global batch size"):
         ReferenceTrainer(reference.model, replace(cluster(1), global_batch_size=6))
+
+
+def test_completion_read_precedes_commit_and_waits_for_cuda(reference, torch_module, device, monkeypatch):
+    torch = torch_module
+    ids = next_sample_ids(reference.commit.state)
+    original_step = reference.optimizer.step
+    original_item = torch.Tensor.item
+    original_acknowledge = reference.commit.acknowledge
+    optimizer_returned = False
+    completion_read = False
+    read_value = None
+    event = torch.cuda.Event() if device == "cuda" else None
+
+    def observe_step():
+        nonlocal optimizer_returned
+        original_step()
+        if event is not None:
+            event.record()
+        optimizer_returned = True
+
+    def observe_item(tensor, *args, **kwargs):
+        nonlocal completion_read, read_value
+        if optimizer_returned and not completion_read:
+            assert reference.commit.state.committed_global_step == 0
+            assert next_sample_ids(reference.commit.state) == ids
+            assert tensor.requires_grad and tensor.numel() == 1
+            read_value = original_item(tensor, *args, **kwargs)
+            completion_read = True
+            return read_value
+        return original_item(tensor, *args, **kwargs)
+
+    def observe_acknowledge(worker, step):
+        assert optimizer_returned and completion_read
+        if event is not None:
+            assert event.query(), "CUDA optimizer operations must finish before commit"
+        return original_acknowledge(worker, step)
+
+    monkeypatch.setattr(reference.optimizer, "step", observe_step)
+    monkeypatch.setattr(torch.Tensor, "item", observe_item)
+    monkeypatch.setattr(reference.commit, "acknowledge", observe_acknowledge)
+    result = reference.train_step()
+    assert result.committed_global_step == 1
+    assert result.loss_global_sum == read_value
+
+
+def test_completion_read_failure_does_not_advance_commit(reference, torch_module, monkeypatch):
+    torch = torch_module
+    ids = next_sample_ids(reference.commit.state)
+    original_step = reference.optimizer.step
+    original_item = torch.Tensor.item
+    optimizer_returned = False
+
+    def observe_step():
+        nonlocal optimizer_returned
+        original_step()
+        optimizer_returned = True
+
+    def fail_completion_read(tensor, *args, **kwargs):
+        if optimizer_returned:
+            raise RuntimeError("injected optimizer completion read failure")
+        return original_item(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(reference.optimizer, "step", observe_step)
+    monkeypatch.setattr(torch.Tensor, "item", fail_completion_read)
+    with pytest.raises(RuntimeError, match="completion read failure"):
+        reference.train_step()
+    assert optimizer_returned
+    assert reference.commit.state.committed_global_step == 0
+    assert next_sample_ids(reference.commit.state) == ids
+    # The injected read failure follows the update; this trainer is discarded.
+    assert reference.optimizer.state
+    assert all(original_item(state["step"]) == 1 for state in reference.optimizer.state.values())

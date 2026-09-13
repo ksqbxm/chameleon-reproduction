@@ -1,4 +1,5 @@
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,3 +60,57 @@ def test_valid_container_check_does_not_mutate_metadata():
     before = deepcopy(report)
     validate_container(report)
     assert report == before
+
+
+@pytest.fixture
+def torch_module():
+    import torch
+    return torch
+
+
+@pytest.mark.parametrize("distributed_available", [False, True])
+@pytest.mark.parametrize("nccl_available", [False, True])
+@pytest.mark.parametrize("gpu_count", [0, 8])
+def test_nccl_report_uses_build_support_not_gpu_visibility(torch_module, monkeypatch,
+                                                         distributed_available, nccl_available, gpu_count):
+    from chameleon.environment import environment_report
+    torch = torch_module
+    dist = torch.distributed
+    calls = []
+    # Feature flags and metadata only; no backend or collective is replaced.
+    monkeypatch.setattr(dist, "is_available", lambda: distributed_available)
+
+    def nccl_support():
+        assert distributed_available
+        return nccl_available
+
+    def nccl_version():
+        assert distributed_available and nccl_available
+        calls.append("version")
+        return (2, 27, 3)
+
+    monkeypatch.setattr(dist, "is_nccl_available", nccl_support)
+    monkeypatch.setattr(torch.cuda.nccl, "version", nccl_version)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: gpu_count > 0)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: gpu_count)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: f"metadata-device-{index}")
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda index: SimpleNamespace(total_memory=1024 + index))
+    report = environment_report()
+    expected = "2.27.3" if distributed_available and nccl_available else None
+    assert report["nccl"] == expected
+    assert calls == (["version"] if expected is not None else [])
+    assert report["visible_gpu_count"] == len(report["gpus"]) == gpu_count
+    assert [gpu["index"] for gpu in report["gpus"]] == list(range(gpu_count))
+
+
+def test_absent_nccl_allows_cpu_and_rejects_cuda(torch_module, monkeypatch):
+    torch = torch_module
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_gloo_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_nccl_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    assert validate_device("cpu", 2) == "gloo"
+    with pytest.raises(RuntimeError, match="CUDA mode requires real NCCL"):
+        validate_device("cuda", 2)

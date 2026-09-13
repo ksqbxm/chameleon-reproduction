@@ -67,11 +67,13 @@ class ReferenceTrainer:
         for parameter in parameters.values():
             parameter.grad.div_(len(ids))
         self.optimizer.step()
+        # The scalar read waits for queued CUDA updates before confirming the step.
+        loss_global_sum = loss_sum.item()
         self.commit.acknowledge(self.commit.state.workers[0],
                                 self.commit.state.committed_global_step + 1)
         return ReferenceStep(
             self.commit.state.committed_global_step, ids, losses.detach().cpu().clone(),
-            loss_sum.item(),
+            loss_global_sum,
             {name: p.detach().cpu().clone() for name, p in parameters.items()},
             {name: p.grad.detach().cpu().clone() for name, p in parameters.items()},
             {name: {key: value.detach().cpu().clone() for key, value in self.optimizer.state[p].items()}

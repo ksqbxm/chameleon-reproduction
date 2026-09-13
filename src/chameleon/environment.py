@@ -1,6 +1,5 @@
 """Read-only environment checks and a bounded, real spawn communication smoke."""
 
-import gc
 import importlib.metadata
 import json
 import multiprocessing as mp
@@ -46,6 +45,7 @@ def validate_device(device: str, world_size: int) -> str:
 
 def environment_report() -> dict:
     import torch
+    import torch.distributed as dist
 
     packages = {}
     for name in EXPECTED_PACKAGES:
@@ -53,7 +53,7 @@ def environment_report() -> dict:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
-    nccl = torch.cuda.nccl.version() if torch.cuda.is_available() else None
+    nccl = torch.cuda.nccl.version() if dist.is_available() and dist.is_nccl_available() else None
     if isinstance(nccl, tuple):
         nccl = ".".join(map(str, nccl))
     return {
@@ -209,7 +209,6 @@ def run_spawn_smoke(device: str, world_size: int, *, timeout_s: float = 60,
             for p in processes:
                 if not p.is_alive():
                     p.close()
-    gc.collect()
     audit["rendezvous_removed"] = not Path(audit["rendezvous_dir"]).exists()
     # Probe both listening state and rebinding after the rendezvous server exits.
     with socket.socket() as probe:

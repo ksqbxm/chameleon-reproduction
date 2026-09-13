@@ -1,0 +1,7 @@
+# No installation is needed in the target container.
+# PyTorch and pytest 8.1.1 are supplied by the environment (docs/MASTER_PLAN.md).
+# Do not install, upgrade, or downgrade the container's dependencies.
+# setuptools is build-only: needed by pyproject.toml to package the src layout;
+# the declared scientific libraries do not provide a Python build backend.
+# Check availability before building; do not use isolated builds that download it.
+setuptools

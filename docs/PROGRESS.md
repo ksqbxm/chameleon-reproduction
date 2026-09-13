@@ -1,6 +1,6 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
 
 ## 状态
 
@@ -11,7 +11,8 @@
 | 03 | owner 清单/重叠检查已实现；CUDA 浮点断言已修正；待服务器重跑验收 | 用户回传 CUDA 70 passed / 1 failed；修正后本机 CPU 32 passed / 39 errors，CUDA 配置阶段退出，均因缺少 torch |
 | 04 | 服务器全仓回归通过；NGC 版本表示检查已修正；双 GPU 校准待重跑 | 用户回传全仓 318 passed、Task04 CUDA 115 passed / 3 setup errors（环境合同阻断）；本次合同测试 54 passed；原 CUDA 命令本机因缺 torch 配置阶段退出 |
 | 05 | 算法单测已验；真实 CPU profile 接入待验 | 审阅后 Task05 161 passed / 3 errors（缺 torch）；全仓 421 passed / 89 errors（缺 torch）；GPU runtime 闭环在 09/10 |
-| 06-15 | 待实施 | 未执行 |
+| 06 | 已实现并审阅修正；本机 CPU oracle 已验；固定容器待复验 | 审阅后指定四文件 288 passed；调度/Estimator 回归 161 passed；无失败或跳过；本 task 不要求独立 GPU 测试 |
+| 07-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -353,6 +354,65 @@ python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py 
 ```bash
 python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/integration/test_profile_estimator.py -q --device cpu --junitxml=artifacts/test-results/task05-review-server-cpu.xml
 ```
+
+## Task 06 实现与开发验证（2026-09-13）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task 05/06、后续 Restorer/selector 接口需求及现有合同/Estimator/Profiler。适用父目录与仓库未发现额外 AGENTS.md；遵循最小实现、局部修改、现有依赖和唯一进度文件规则。保留既有 Task05 工作，本次没有修改其实现、依赖或环境。
+- 算法依据核对为论文 [Algorithm 1 与 Planner 原文](https://arxiv.org/html/2508.21613v4#S4.SS1)，执行范围以总计划及 Task06 为准。没有硬编码论文或主机路径。
+- 修改范围仅为新增 `src/chameleon/planner.py`、`tests/unit/test_integer_partitions.py`、`test_batch_distribution.py`、`test_layer_distribution.py`、`tests/integration/test_dynamic_planner_oracle.py`，及本进度文件。
+- 整数分拆：递归枚举当前 survivor 数的非降序 pipeline lengths，全部使用现有资源，dp/pp 严格落在显式 Rdp/Rpp（支持不连续范围）；去除 pipeline 排列重复并稳定排序。每个实际 survivor 状态独立调用，不将不同故障数的候选混选为一个 runtime plan。
+- batch：以整数运算按 pipeline 节点比例取 floor，递归枚举余数的全部弱组合，包括多个余数落在同一 pipeline；随后修复每个 zero partition。donor 每次重新取当前最大分区，同分取较小 pipeline ID；Nm>=dp 时守恒且全部非零，Nm<dp 返回无可行 batch。global Nm 从固定 B 与 micro-batch size 作向上整除，避免混用 sample count 和每 pipeline Nm。
+- layers：blocks 先均分，枚举余数 stage 的组合，每个余数 stage 仅增加一个 block。保持完整 module_order，所有 pipeline 包含完整模型；前缀模块归首 stage，后缀（norm/head/新增末端模块）归尾 stage，层间附属模块归前一 block。允许有模块的零 block 端点 stage，排除完全空 stage。
+- Planner 接入现有 Estimator Eq.10/11/14，时间和内存都包含全部端点成本；先估内存，OOM 候选保留逐 stage 原因且不伪造时间。`Planner.candidates(state)` 输出动态候选与诊断，`best_dynamic_plan(state)` 只在可行候选中按 estimated step time、稳定 plan ID 最小化；所有 OOM 或无合法分拆时抛出 `NoFeasibleDynamicPlanError`。检查 config/profile identity、layer count 和固定 B。
+- plan ID 绑定完整 survivor worker identity（含 rank/generation）、布局、batch 和完整 profile 内容；输入 worker/Rdp/Rpp 排列不改变结果。输出为待 Restorer 处理的逻辑 target slots，不填写未知 transition 时间，不接收 D，不输出 score，不执行 rerouting、Equation8 policy selection 或恢复。物理 worker-to-slot 匹配、完整 survivor state sources 检查和 transition 校准继续由 Task07 实现；缓存与预计算继续由 Task15 实现。
+- 独立 oracle 用笛卡尔积枚举小空间（不用生产分拆/batch/layer helper），使用手写 1F1B phase 队列与离散完成事件模拟时间，按手算公式推导内存。核对完整候选集、逐候选时间/峰值及最佳 plan；覆盖非对称 lengths、Nm<dp、零值反复修复、余数重复分配、完整端点布局、同时间 tie-break、不同 survivor count/identity、端点 OOM、全部 OOM 和容量临界点。
+- 测试环境为额外开发验证：Windows / Python 3.13.12 / pytest 9.1.1，torch 不存在；device=cpu，backend/worker/GPU 均未启动。Task06 算法不依赖 torch 执行，指定 CPU 组合全部通过；这不替代 Ubuntu/Python3.12.3/pytest8.1.1 固定容器复验，也不改变 Task04/05 未验状态。没有安装、升级、降级依赖或访问服务器。
+
+实际运行记录（每个小功能完成后执行最窄测试）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/unit/test_integer_partitions.py -q --device cpu` | 0 | 136 passed |
+| `python -m pytest tests/unit/test_batch_distribution.py -q --device cpu` | 0 | 73 passed |
+| 初版 `python -m pytest tests/unit/test_layer_distribution.py -q --device cpu` | 1 | 45 passed / 1 failed；独立断言发现层间附属模块切分边界错误 |
+| 修正边界后同一 layer 命令 | 0 | 46 passed |
+| 初版 `python -m pytest tests/integration/test_dynamic_planner_oracle.py -q --device cpu --tb=short` | 1 | 24 passed / 2 failed；fixture 没有产生同时间 plan，330 字节也没有可行 plan。完整候选/时间 oracle 已通过；改用明确同时间的单 stage 双 pipeline fixture 与独立核算的 400 字节容量 |
+| 修正 fixture 并加入容量临界点后的同一集成命令 | 0 | 27 passed |
+| worker rank identity 补充后的最窄 `-k 'survivor_counts or exact_time_ties'` | 0 | 2 passed / 25 deselected |
+| 最终 `python -m pytest tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py -q --device cpu --junitxml=artifacts/test-results/task06-cpu.xml` | 0 | 282 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py -q --device cpu --junitxml=artifacts/test-results/task06-estimator-regression.xml` | 0 | 161 passed / 0 failed / 0 errors / 0 skipped |
+| 新增文件 `python -m compileall -q ...`；AST/空白审阅；`git diff --check` | 0 | 通过 |
+
+- 实际日志/XML 为 `artifacts/test-results/task06-cpu.log/.xml` 和 `task06-estimator-regression.log/.xml`；逐项核对 JUnit 计数与无 errors/failures/skips，汇总保存为 `task06-local-summary.json`。最终逐文件审阅新增代码与文档 diff；未引入未声明第三方库、旧接口 adapter、skip/fallback、任意 timing 常量或额外进度文档。
+- 本 task 没有多进程通信、PID/端口/rendezvous/kill 资源，因此这些审计不适用；不宣称执行了真实训练/迁移或 GPU runtime 闭环。当前统一使用调用方显式提供的同质 target-slot memory capacity，Eq.14 与 computation-only 时间估计的近似边界保持不变。
+- 未验证项为固定容器 CPU 复验，尚未执行服务器命令；Task04 双 GPU 校准和 Task05 真实 CPU profile 接入仍待前述验收。Task06 没有独立必测 GPU 命令，GPU runtime 闭环仍在 Task09/10；下一项为 Task07，尚未实现。
+
+固定容器中从项目工作目录执行（使用既有 python，无需安装依赖）：
+
+```bash
+python -m pytest tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py -q --device cpu --junitxml=artifacts/test-results/task06-server-cpu.xml
+```
+
+## Task 06 审阅与优化（2026-09-13）
+
+- 按用户要求对照 `CLAUDE.md`、总计划和 Task06，检查整数分拆、batch 修复、完整 module layout、Estimator 组合、最优 dynamic 时间与状态绑定。修改范围仅为 `src/chameleon/planner.py`、`tests/integration/test_dynamic_planner_oracle.py` 及本进度文件；未修改既有合同、Estimator/Profiler、环境、依赖或后续任务。
+- 正确性问题：原 Planner 只校验 `len(layer_modules)==num_layers`，同样数量的 embedding/head/norm 可以冒充 blocks，造成真实 block 被划入端点、层均分空间和 Eq.14 平均成本错误；倒序 blocks 也会通过入口。现按当前 TinyTransformer 的稳定模块合同，严格要求 inventory 等于配置对应的完整 `blocks.0..blocks.(L-1)` 有序序列。删除旧数量分支，不进行自动修补或兼容；新增端点替换、倒序与缺失 block 的拒绝测试。原人为修改 Estimator 内部 inventory 的测试也已替换为通过正常构造入口验证。
+- 简洁性问题：原内存估计放在全 pipeline 层布局的笛卡尔积内，同一 pipeline/layout 随其他 pipeline 的组合被反复估计。现每个 topology 先生成各 pipeline 的 `(layout, memory)` 选项，再枚举组合；OOM 状态也只对组合计算一次，不在各 batch 内重复求值。没有新增持久 cache、替代算法或额外接口。三条双 stage pipeline 的独立测试仍输出全部 48 个候选，真实 Estimator 内存调用从 24 次降到 6 次。
+- 完备性验证：原独立穷举/事件/内存 oracle 全部通过，继续核对完整候选集、逐候选时间与峰值、端点 OOM、容量等于上限、全部 OOM、Nm<dp、零分区修复、无合法分拆、不同 survivor 状态与稳定 tie-break。合法配置中的全部端点仍参与成本；D、transition、rerouting 与 policy selection 的边界未改变。
+
+实际命令与结果：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 修改前 Task06 四文件组合（`--junitxml=artifacts/test-results/task06-review-baseline.xml`） | 0 | 282 passed |
+| `python -m pytest tests/integration/test_dynamic_planner_oracle.py -q --device cpu -k 'endpoint_substitution or memory_is_not_recomputed' --tb=short --junitxml=artifacts/test-results/task06-review-before.xml` | 1 | 5 failed / 27 deselected；4 项 inventory 入口未拒绝，1 项重复内存计算（24 而非 6 次） |
+| 修正后同文件 `-k 'endpoint_substitution or memory_is_not_recomputed or changed_global_batch'` | 0 | 7 passed / 26 deselected |
+| `python -m pytest tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py -q --device cpu --junitxml=artifacts/test-results/task06-review-cpu.xml` | 0 | 288 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py -q --device cpu --junitxml=artifacts/test-results/task06-review-estimator.xml` | 0 | 161 passed / 0 failed / 0 errors / 0 skipped |
+| 修改 Python 文件 compileall、AST/空白审阅、`git diff --check` | 0 | 通过 |
+
+- 已核对最终 JUnit 288/161 tests，全部无 failures/errors/skips；上述 XML 有同 basename 的真实日志，位于 `artifacts/test-results/`。汇总为 `task06-review-local-summary.json`，审阅差异为 `task06-review.diff`；修改前快照只位于忽略的 artifacts 供差异审阅，不是可执行兼容路径。
+- 本机仍为 Windows / Python 3.13.12 / pytest 9.1.1、无 torch，device=cpu；没有启动 backend、worker、GPU、kill 或产生 PID/端口/rendezvous 资源，没有安装或改变环境、访问服务器。当前统一 memory capacity 和 Eq.14/computation-only 估计边界保持不变。固定容器复验及前置 Task04/05 的待验项仍未执行，不宣称真实训练/迁移验收通过；服务器沿用上节 Task06 CPU 命令执行当前实现。
 
 ## 每次完成小功能的记录格式
 

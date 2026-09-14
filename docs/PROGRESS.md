@@ -942,6 +942,24 @@ python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_ki
 - 日志/报告：`artifacts/test-results/task12-review-{red|errors-red|schema-red|contracts|missing-slots|regression|cpu}.xml`、`task12-review-{red|contracts|regression|cpu}.log`、`task12-review-gpu-local.log`；统计与本次协议资源审计保存为 `task12-review-summary.json`。最终回归实际产生8个恢复协议运行（3成功、5拒绝）；全部backend=metadata、clean=True，均清理4个原PID，无存活worker、全部generation store已删除；连续恢复场景3个store、2个retired被kill PID均被审计。
 - 未验证项：新增真实 source mutation 拒绝与 Task12 全部 CPU/Gloo、GPU/NCCL、AdamW续训、真实训练group异常/hang清理，以及共享 Runtime 的Task09–11训练回归，仍须按上一节固定容器入口执行。没有把本机协议测试等同真实训练验收；Task12仍不能标完成。
 
+## Task 12 服务器日志诊断与重新执行（2026-09-14）
+
+- 根据用户最新指令忽略此前描述的结果，仅依据实际附件。附件服务器命令未传 `--device`、`--world-size`，默认CPU/2 workers；实际为10个setup errors，首处异常均是 `recovery_setup` 的 `Task12 DP2/PP2 acceptance requires --world-size 4`。模块fixture失败发生在profile/runtime启动之前；没有worker traceback或恢复审计，不能将这次结果归因于transfer/group问题。
+- 根因与修正位置：应在运行命令显式传入 `--world-size 4`，与Task12的DP2/PP2合同一致。没有修改production、fixture、默认worker数、regex或任何正确性检查，没有增加兼容/兜底分支。五项成功场景与全部故障注入case均未执行恢复，无法据此判定topology atomicity、state/hash、source lifetime、source_mutation异常包装或训练清理是否正确。
+- 本次可执行环境仍为本机Windows / Python3.13.12 / pytest9.1.1，无torch；没有连接服务器，没有安装或修改环境。按用户要求依次运行最小失败入口→完整distributed/e2e→全量unit，额外检查显式CUDA入口。以下是本机结果，不是服务器复测结果。
+
+实际命令与结果：
+
+| 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/distributed/test_full_state_transfer.py::test_complete_model_and_adamw_hashes_survive_missing_only_p2p -vv --device cpu --world-size 4 --tb=long --junitxml=artifacts/test-results/task12-server-log-recheck-minimal.xml` | 1 | 1 setup error，缺torch；未启动训练worker |
+| `python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -vv --device cpu --world-size 4 --tb=long --junitxml=artifacts/test-results/task12-server-log-recheck-suite.xml` | 1 | 10 setup errors，全部缺torch；未执行恢复 |
+| `python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -vv --device cuda --world-size 4 --require-gpu --tb=long` | 4 | 配置阶段缺torch；无GPU执行、skip或fallback |
+| `python -m pytest tests/unit -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task12-server-log-recheck-unit.xml` | 1 | 798 passed / 81 errors / 0 failures/skipped；81项均缺torch，未排除任何unit测试 |
+
+- 报告/日志：`artifacts/test-results/task12-server-log-recheck-{minimal|suite|unit}.xml`、同名 `.log`、`task12-server-log-recheck-gpu.log` 与 `task12-server-log-recheck-summary.json`。JUnit错误分类逐项核对，全部本机error均为ModuleNotFoundError。源码未改动；仅本进度文件与忽略的运行报告新增。
+- 服务器后续顺序：最小成功恢复入口加 `--device cpu --world-size 4 -vv --tb=long`；完整两个文件加同样参数；`python -m pytest tests/unit -q --device cpu --world-size 4 --tb=short`；最后完整两个文件加 `--device cuda --world-size 4 --require-gpu -vv --tb=long`。保留完整worker traceback、JUnit及本次生成的runtime审计JSON，再根据实际第一处运行时异常判断是否需要修改共享production根因。Task12真实CPU/GPU恢复验收状态仍为待验。
+
 ## 每次完成小功能的记录格式
 
 - Task / 小功能：

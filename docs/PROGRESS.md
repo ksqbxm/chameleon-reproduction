@@ -720,6 +720,41 @@ python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed
 
 用户回传完整日志、JUnit 和本次新生成的 runtime JSON 后，核对实际双向warmup、FP32 precision、数值与清理，再更新验收状态。
 
+## FP32 attention bias 更新差异修复（2026-09-14）
+
+- 输入：用户回传最新 `runtime-server-gpu.xml` 对应的终端日志，32项中31 passed / 1 failed。唯一失败为对称 FP32 smoke 的参数更新对照，12元素参数有4元素超差，最大绝对差 `0.00019732143846340477` 位于索引6，最大相对差位于索引7；worker 的 FP32 matmul precision 已为 highest。此前的端口/P2P/深流水线报错没有再次出现；日志没有打印参数名，也没有提供原始 JUnit/状态捕获文件，因此不能把具体 block 的梯度残差视为已直接测得。
+- 已重新核对 `CLAUDE.md`、总计划、Task02/09/10、模型、reference、runtime、Profiler、完整 AdamW inventory 与验收测试；没有额外仓库/祖先 AGENTS.md。修改前工作区干净。本次仅修改 `src/chameleon/model.py`、`tests/unit/test_model_data.py`、对称/非对称训练验收测试与本进度文件；不修改依赖、环境、reference 算法、AdamW 超参数或数值容差。
+- 根因分析：H=4 时 attention 的 Q/K/V 合并 bias 长度为12，K 对应索引4–7，与日志特征吻合。对一个 query，所有 key 加同一个 bias 只会给所有有效 attention scores 增加相同常量，softmax 后抵消；K bias 是冗余的 trainable 自由度。FP32 backward/累加顺序可留下理论零梯度的舍入残差；[AdamW 的更新公式](https://docs.pytorch.org/docs/2.8/generated/torch.optim.AdamW.html)使首步 `lr*g/(abs(g)+eps)` 对这些小残差敏感。例如 `g=2.5e-9`、默认 `lr=1e-3/eps=1e-8` 得到约 `2e-4` 的更新，梯度可满足 `atol=1e-6` 而参数更新不满足。具体失败参数的身份与真实残差仍需服务器带名称的新断言验证。
+- 模型修复：用既有 [PyTorch parametrization API](https://docs.pytorch.org/docs/2.8/generated/torch.nn.utils.parametrize.register_parametrization.html) 仅保留独立、连续存储的 Q/V 两个 H 元素 Parameter；MultiheadAttention 所需的3H bias由 Q/零常量/V 唯一生成。初始化时移除原3H trainable Parameter，K没有 Parameter、gradient 或 AdamW state；没有训练后清零、梯度阈值、旧状态转换或兼容加载路径。Q/V、out projection、FFN、LayerNorm 等有效 bias 保留。参数化在构造 optimizer 前完成，不额外消耗初始化 RNG；full model 与所有 stage 共享此结构。
+- 完备性审阅：Runtime、Profiler、SUM owner mapping、Restorer inventory 均按当前 `named_parameters()` 动态发现参数，Q/V 新名称仍归属 `blocks.N`；不存在遗留的固定 `in_proj_bias` 参数引用。实际名称为 `blocks.N.self_attn.parametrizations.in_proj_bias.original0/original1`。Profiler model hash 包含当前模块类型、名称/形状，因此结构变化会使旧 profile identity 失效，应重新采样，不提供旧 profile/state adapter。worker 本地构造模型，状态捕获只保存 tensor 字典；未引入整模型 pickle。保留原 CUDA full FP32 matmul precision 合同。
+- 回归补齐：删除之前仅对比梯度的单步测试，替换为分配 `[4,4]`、`[6,5]`、`[10,6,3]` 的连续3步独立 full-batch reference 与拆分 stage/micro-batch 对照，检查所有参数、SUM/B 后梯度和完整 AdamW step/exp_avg/exp_avg_sq；后两种分配覆盖不等样本量和 partial micro-batch。新增 Q/V 独立存储、K无 trainable 参数、非零 Q/V 与任意非零 K bias 的 unrestricted attention 前向等价、当前 state_dict 严格 roundtrip 检查。对称与非对称真实 FP32 验收从1步扩至3步；数值失败消息显示 step、参数名和状态字段。未放宽任何容差。
+
+实际本机命令与结果（项目工作目录）：
+
+| 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 修改模型前：`python -m pytest tests/unit/test_model_data.py -q --device cpu -k three_partitioned_adamw --tb=short --junitxml=artifacts/test-results/fp32-bias-before.xml` | 1 | 3 setup errors / 14 deselected，全部缺torch，不能声称本机复现GPU数值错误 |
+| 修改模型后：`python -m pytest tests/unit/test_model_data.py -q --device cpu -k 'attention or three_partitioned_adamw' --tb=short --junitxml=artifacts/test-results/fp32-bias-model.xml` | 1 | 5 setup errors / 14 deselected，全部缺torch |
+| `python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py -q --device cpu --tb=short --junitxml=artifacts/test-results/fp32-bias-contracts.xml` | 0 | 61 passed / 0 failures / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_model_data.py tests/unit/test_reference.py tests/unit/test_profiler.py tests/integration/test_restorer_inventory.py tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/fp32-bias-cpu.xml` | 1 | 28 passed / 73 setup errors，全部错误均为缺torch；真实训练worker未启动 |
+| `python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cpu --world-size 7 --tb=short --junitxml=artifacts/test-results/fp32-bias-dynamic-cpu.xml` | 1 | 16 setup errors，全部缺torch |
+| `python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py tests/unit/test_model_data.py -q --device cuda --world-size 4 --require-gpu --tb=short --junitxml=artifacts/test-results/fp32-bias-gpu.xml` | 1 | 配置阶段 ERROR: No module named 'torch'；没有GPU/worker执行，没有生成GPU JUnit |
+| 上述Task09两个文件与 `tests/unit/test_model_data.py` 的 `--collect-only -q --device cpu --world-size 4` | 0 | 36项可发现，不代表训练通过 |
+| `python -m compileall -q src tests`；`git diff --check`；最终diff/调用方审阅、JUnit解析 | 0 | 语法、diff检查通过；未运行未声明的工具或安装依赖 |
+
+- 本机环境：Windows/Python3.13.12/pytest9.1.1，缺torch。数学分析输出在 `artifacts/test-results/fp32-bias-math.json`：标准库 causal softmax 概率在改变 K bias 后最大差 `1.1102230246251565e-16`，示例 AdamW 更新约 `2e-4`；这是数学说明，**不是 PyTorch 模型或GPU验收**。实际 JUnit 统计/错误分类在 `fp32-bias-local-summary.json`。合同中的标准库 metadata 子进程正常清理不能替代真实训练/通信清理证明。
+- 未验证：新结构的真实CPU/GPU前向、RNG、state_dict、deepcopy/reference、完整参数/梯度/AdamW、Profiler与迁移inventory、对称/非对称NCCL/SUM和资源清理。没有访问服务器、安装/改变环境或执行GPU训练。Task09/10验收仍未完成。
+- 日志末尾的 Bash syntax errors 是把 Python 循环直接粘到 Bash 造成，未产生额外梯度诊断。使用下面的 pytest 入口；失败信息已直接包含参数名，无需在 Bash 执行 Python 片段。
+
+固定容器复测（项目工作目录、既有python，无需安装项目）：
+
+```bash
+python -m pytest tests/unit/test_model_data.py tests/unit/test_reference.py tests/unit/test_profiler.py tests/integration/test_restorer_inventory.py tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/fp32-bias-server-gpu.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/fp32-bias-server-dynamic-gpu.xml
+```
+
+回传新JUnit、终端日志与本次新生成的 runtime JSON 后再核对数值与清理。结构修复与回归已实现；不宣称尚未执行的真实训练验证通过。
+
 ## 每次完成小功能的记录格式
 
 - Task / 小功能：

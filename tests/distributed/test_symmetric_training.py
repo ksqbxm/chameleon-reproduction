@@ -41,12 +41,15 @@ def assert_numerical_step(actual, expected, device, *, fp32=False):
         assert set(report["synchronized_parameters"]) == snapshot["parameters"].keys()
         for name, parameter in snapshot["parameters"].items():
             owners[name] += 1
-            torch.testing.assert_close(parameter, expected.parameters[name], **tolerance)
-            torch.testing.assert_close(snapshot["gradients"][name], expected.gradients[name], **tolerance)
+            torch.testing.assert_close(parameter, expected.parameters[name], **tolerance,
+                                       msg=lambda message: f"step {actual['step_id']}, {name}, parameter: {message}")
+            torch.testing.assert_close(snapshot["gradients"][name], expected.gradients[name], **tolerance,
+                                       msg=lambda message: f"step {actual['step_id']}, {name}, gradient: {message}")
             state = snapshot["optimizer_state"][name]
             assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
             for field, value in state.items():
-                torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance)
+                torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance,
+                                           msg=lambda message: f"step {actual['step_id']}, {name}, AdamW.{field}: {message}")
     dp_size = len({report["pipeline"] for report in actual["reports"]})
     assert owners == Counter({name: dp_size for name in expected.parameters})
     assert {name.split(".")[0] for name in owners} == {"embedding", "blocks", "final_norm", "lm_head"}
@@ -170,14 +173,16 @@ def test_small_schedules_and_fp32_smoke(distributed_environment, device, world_s
     dtype = "float32" if case == "fp32" else "float64"
     runtime = SymmetricRuntime(topology, device=device, dtype=dtype, capture_state=True)
     with runtime:
-        actual = runtime.train_step()
+        steps = [runtime.train_step() for _ in range(3 if case == "fp32" else 1)]
     assert_p2p_warmup(runtime)
     if case == "fp32" and device == "cuda":
         assert all(row["float32_matmul_precision"] == "highest" for row in runtime.ready)
     reference = ReferenceTrainer(build_initial_model(config, device=device, dtype=getattr(torch, dtype)),
                                  ClusterState((WorkerIdentity("reference", 0, 0),), batch))
-    assert_numerical_step(actual, reference.train_step(), device, fp32=case == "fp32")
-    assert_trace_dependencies(actual["reports"], stages=len(stages), count=topology.global_micro_batches // topology.dp_size)
+    for actual in steps:
+        assert_numerical_step(actual, reference.train_step(), device, fp32=case == "fp32")
+        assert_trace_dependencies(actual["reports"], stages=len(stages), count=topology.global_micro_batches // topology.dp_size)
+    assert runtime.state.committed_global_step == len(steps)
     assert runtime.audit["clean"] and all(worker["exitcode"] == 0 for worker in runtime.audit["workers"])
 
 

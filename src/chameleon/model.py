@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn.utils.parametrize import register_parametrization
 
 from .contracts import ModelConfig
 
@@ -31,6 +32,17 @@ def parameter_inventory(model: nn.Module) -> tuple[ParameterInfo, ...]:
     return tuple(inventory)
 
 
+class _QueryValueBias(nn.Module):
+    """A key projection bias cancels in softmax; train only query/value biases."""
+
+    def forward(self, query_bias: torch.Tensor, value_bias: torch.Tensor) -> torch.Tensor:
+        return torch.cat((query_bias, torch.zeros_like(query_bias), value_bias))
+
+    def right_inverse(self, bias: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        query_bias, _, value_bias = bias.chunk(3)
+        return query_bias.clone(), value_bias.clone()
+
+
 class TinyTransformer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -44,6 +56,8 @@ class TinyTransformer(nn.Module):
             )
             for _ in range(config.num_layers)
         )
+        for block in self.blocks:
+            register_parametrization(block.self_attn, "in_proj_bias", _QueryValueBias())
         self.final_norm = nn.LayerNorm(config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 

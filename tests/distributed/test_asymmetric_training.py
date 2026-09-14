@@ -121,13 +121,15 @@ def test_fp32_or_failure_cleans_nonuniform_topology(distributed_environment, dev
                                behavior=case if case != "fp32" else "normal")
     if case == "fp32":
         with runtime:
-            actual = runtime.train_step()
+            steps = [runtime.train_step() for _ in range(3)]
         assert_p2p_warmup(runtime)
         if device == "cuda":
             assert all(row["float32_matmul_precision"] == "highest" for row in runtime.ready)
         reference = ReferenceTrainer(build_initial_model(config, device=device, dtype=torch.float32),
                                      ClusterState((WorkerIdentity("reference", 0, 0),), 19))
-        assert_numerical_step(actual, reference.train_step(), device, fp32=True)
+        for actual in steps:
+            assert_numerical_step(actual, reference.train_step(), device, fp32=True)
+        assert runtime.state.committed_global_step == 3
     else:
         with pytest.raises(RuntimeErrorWithAudit, match="hard timeout" if case == "hang" else "injected|abnormally"):
             with runtime:

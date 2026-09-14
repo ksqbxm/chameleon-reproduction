@@ -185,6 +185,23 @@ def test_concurrent_runtimes_have_independent_rendezvous_files(metadata_runtime,
                for runtime in (metadata_runtime, other))
 
 
+def test_closing_first_runtime_does_not_claim_second_workers_as_leaks(metadata_runtime, monkeypatch):
+    from chameleon import runtime as module
+    monkeypatch.setattr(module, "_runtime_worker", partial(_metadata_worker, fault="none"))
+    other = SymmetricRuntime(metadata_runtime.topology)
+    try:
+        metadata_runtime.__enter__()
+        other.__enter__()
+        metadata_runtime.close()
+        assert other.snapshot_profiles() == [None] * 4
+        assert all(process.is_alive() for process in other.processes)
+    finally:
+        other.close()
+        metadata_runtime.close()
+    assert all(runtime.audit["clean"] and not runtime.audit["leaked_pids"]
+               for runtime in (metadata_runtime, other))
+
+
 def _collect_incomplete_frame(incoming, result, value):
     connection = Connection(incoming.detach())
     runtime = object.__new__(SymmetricRuntime)
@@ -272,6 +289,108 @@ def _metadata_worker(value, rank, device, backend, dtype, rendezvous_file, timeo
                          profile=None, padding="x" * 65536)
     finally:
         connection.close()
+
+
+def _step_metadata_worker(value, rank, device, backend, dtype, rendezvous_file, timeout, connection,
+                          origin, lr, weight_decay, behavior, directory, capture_state, *, fault="none"):
+    """Exercise control/commit ordering with metadata; no training tensors or backend."""
+    from chameleon.runtime import _write_reply
+
+    worker, state = value.ranks[rank], value.state
+    pipeline, stage = value.location(rank)
+    try:
+        _write_reply(connection, directory, rank, "ready", worker, pid=mp.current_process().pid,
+                     parameter_names=["protocol-only"], groups=[], device=device, backend=backend)
+        while True:
+            token = connection.recv_bytes(maxlength=7)
+            if token == b"stop":
+                break
+            assert token == b"step"
+            batches = value.micro_batches(state, pipeline)
+            last = stage == value.pipeline_lengths[pipeline] - 1
+            step_id = state.committed_global_step + 1
+            report = dict(pipeline=pipeline, stage=stage,
+                          micro_batches=[list(batch) for batch in batches], profile_step=None,
+                          loss_batches=[dict(sample_ids=list(batch), loss_sum=float(len(batch)))
+                                        for batch in batches] if last else [],
+                          loss_global_sum=float(state.global_batch_size), global_sample_count=state.global_batch_size)
+            identity = replace(worker, generation=worker.generation + 1) if fault == "identity" and rank == 0 else worker
+            acknowledged = True if fault == "step" and rank == 0 else step_id
+            _write_reply(connection, directory, rank, "ack", identity, step_id=acknowledged, **report)
+            assert connection.recv_bytes(maxlength=7) == b"commit"
+            state = replace(state, committed_global_step=step_id)
+            _write_reply(connection, directory, rank, "safe", worker, step_id=step_id)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("failure", ["profile", "snapshot", "deadline"])
+def test_controller_report_failure_is_checked_before_commit(metadata_runtime, monkeypatch, failure):
+    from chameleon import runtime as module
+    monkeypatch.setattr(module, "_runtime_worker", _step_metadata_worker)
+
+    def comparison(*_):
+        if failure == "profile":
+            raise ValueError("injected profile comparison failure")
+        return None
+
+    monkeypatch.setattr(module, "compare_runtime_profile", comparison)
+    runtime = metadata_runtime
+    match = {"profile": "injected profile", "snapshot": "torch|step-1-rank-0", "deadline": "hard timeout"}[failure]
+    with pytest.raises(RuntimeErrorWithAudit, match=match):
+        with runtime:
+            if failure == "snapshot":
+                runtime.capture_state = True
+            elif failure == "deadline":
+                collect = runtime._collect
+                monotonic = time.monotonic
+
+                def collect_then_expire(kind, deadline):
+                    result = collect(kind, deadline)
+                    if kind == "ack":
+                        monkeypatch.setattr(time, "monotonic", lambda: monotonic() + runtime.timeout_s + 1)
+                    return result
+
+                # Expire the real step deadline only after all ACKs have arrived.
+                monkeypatch.setattr(runtime, "_collect", collect_then_expire)
+            runtime.train_step()
+    assert runtime.state.committed_global_step == 0
+    assert runtime.steps == []
+    assert runtime.audit["clean"]
+
+
+def test_single_ack_envelope_preserves_identity_steps_and_sample_accounting(metadata_runtime, monkeypatch):
+    from chameleon import runtime as module
+    monkeypatch.setattr(module, "_runtime_worker", _step_metadata_worker)
+    runtime = metadata_runtime
+    with runtime:
+        for step_id in range(1, 4):
+            step = runtime.train_step()
+            assert runtime.state.committed_global_step == step_id
+            assert step["sample_ids"] == list(range((step_id - 1) * 11, step_id * 11))
+            assert step["global_sample_count"] == step["loss_global_sum"] == 11
+            assert step["safe_worker_ids"] == [worker.worker_id for worker in runtime.topology.ranks]
+            for rank, report in enumerate(step["reports"]):
+                worker = runtime.topology.ranks[rank]
+                assert report["worker"] == dict(worker_id=worker.worker_id, rank=rank, generation=3)
+                assert report["step_id"] == step_id
+                wire = json.loads(Path(runtime.directory, f"rank-{rank}-ack.json").read_text(encoding="utf-8"))
+                assert "report" not in wire
+                assert wire["worker"] == report["worker"] and wire["step_id"] == step_id
+    assert runtime.audit["clean"] and len(runtime.steps) == 3
+    assert all(worker["exitcode"] == 0 for worker in runtime.audit["workers"])
+
+
+@pytest.mark.parametrize("fault,match", [("identity", "identity"), ("step", "step_id must be an integer")])
+def test_ack_identity_and_integer_step_are_checked_before_commit(metadata_runtime, monkeypatch, fault, match):
+    from chameleon import runtime as module
+    monkeypatch.setattr(module, "_runtime_worker", partial(_step_metadata_worker, fault=fault))
+    with pytest.raises(RuntimeErrorWithAudit, match=match):
+        with metadata_runtime:
+            metadata_runtime.train_step()
+    assert metadata_runtime.state.committed_global_step == 0
+    assert metadata_runtime.steps == []
+    assert metadata_runtime.audit["clean"]
 
 
 @pytest.mark.parametrize("fault", ["none", "partial", "identity", "step"])

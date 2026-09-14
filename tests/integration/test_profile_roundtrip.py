@@ -59,6 +59,22 @@ def test_schema_json_roundtrip_is_explicit_and_lossless(schema_profile, profile_
     assert json.loads(path.read_text(encoding="utf-8")) == schema_profile
 
 
+@pytest.mark.parametrize("ids", [(1,), (7,), (1, 0), (0, 2)])
+def test_trace_rejects_gapped_or_reordered_micro_batch_ids(schema_profile, ids):
+    count = len(ids)
+    trace = schema_profile["steps"][0]["trace"]
+    schema_profile["steps"][0]["trace"] = [dict(row, micro_batch=mb, start_s=row["start_s"] + 2 * i,
+                                               end_s=row["end_s"] + 2 * i)
+                                           for i, mb in enumerate(ids) for row in trace]
+    for metric in ("step_time_s", "step_wall_time_s"):
+        schema_profile["metrics"][metric] = dict(samples=[3. * count], ema=3. * count)
+    for metric, series in schema_profile["metrics"].items():
+        if metric.endswith(("forward_s", "backward_s", "output_activation_bytes", "saved_activation_bytes")):
+            series["samples"] *= count
+    with pytest.raises(ValueError, match="1F1B"):
+        validate_snapshot(schema_profile, schema_profile["identity"])
+
+
 @pytest.mark.parametrize("lengths", [[2, 2, 3], [2, 3, 3]])
 def test_asymmetric_parallel_schema_roundtrip_and_stale_depth_rejection(schema_profile, profile_directory, lengths):
     # Schema-only fixture for Task10; real profiles run in test_planner_runtime.

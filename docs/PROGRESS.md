@@ -4,7 +4,7 @@
 
 Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/Estimator/Restorer 组合已实现并审阅修正；本机指定 CPU 组合 108 passed，合同及 Task05–08 算法回归 746 passed。固定容器复验待执行；受影响真实 inventory/校准补测为 39 passed / 22 errors（缺 torch），真实训练中的策略切换按总计划在 Task13 验证。
 
-Task 10 的非对称新建 topology、逐参数 owner groups、DSATUR 异步 SUM、Planner/Restorer scheduling 接入与验收测试已实现。相关合同/算法/profile schema 回归 857 passed；指定真实 CPU 组合 16 setup errors（缺 torch），GPU 未执行。不能标为完成或“CPU 已验”；状态迁移恢复仍在 Task 12。
+Task 10 的非对称新建 topology、逐参数 owner groups、DSATUR 异步 SUM、Planner/Restorer scheduling 接入与验收测试已实现。最新审阅修正了共用 runtime 的并发清理审计、提交前报告处理时序与 ACK 重复字段，以及 Profiler 的 micro-batch 顺序校验；相关合同/算法/profile schema 回归 871 passed；指定真实 CPU 组合 16 setup errors（缺 torch），GPU 未执行。不能标为完成或“CPU 已验”；状态迁移恢复仍在 Task 12。
 
 ## 状态
 
@@ -18,8 +18,8 @@ Task 10 的非对称新建 topology、逐参数 owner groups、DSATUR 异步 SUM
 | 06 | 已实现并审阅修正；本机 CPU oracle 已验；固定容器待复验 | 审阅后指定四文件 288 passed；调度/Estimator 回归 161 passed；无失败或跳过；本 task 不要求独立 GPU 测试 |
 | 07 | 已审阅并修正 plan/estimate/ACK 绑定与 transition 计费；指定 CPU oracle 已验；固定容器与真实路径待验 | 指定四文件 135 passed；Task05/06/07 算法组合 584 passed；真实 inventory/校准/profile 回归 101 passed / 41 errors（缺 torch）；实际通信在 10/12 |
 | 08 | 已实现并审阅修正；本机 CPU 算法组合已验；固定容器与真实路径待验 | 指定两文件 108 passed；合同及 Task05–08 算法回归 746 passed；真实 inventory/校准补测 39 passed / 22 errors（缺 torch）；真实策略切换在 13 |
-| 09 | 已根据服务器报错修正 rendezvous 竞态、首次双向 P2P 连接与 FP32 精度，并重构共用 runtime；真实 CPU/GPU 待复验 | 用户回传 GPU 10 passed / 3 failed / 4 errors；修改后本机共用合同61 passed、相关回归444 passed；CPU 训练/模型27 setup errors（缺 torch）；GPU配置阶段因缺 torch 退出 |
-| 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 历史回归857 passed；最新共用合同61 passed、相关回归444 passed；指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
+| 09 | 已修正服务器报错及共用 runtime 的并发清理、提交时序和 ACK 结构；真实 CPU/GPU 待复验 | 最新共用合同68 passed、相关回归871 passed；本次真实CPU训练/profile组合17 setup errors（缺 torch）；服务器历史结果见下文 |
+| 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 最新共用合同68 passed、相关回归871 passed；本次指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
 | 11-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
@@ -777,6 +777,40 @@ python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed
 ```bash
 python -m pytest tests/unit/test_model_data.py tests/unit/test_reference.py tests/unit/test_profiler.py tests/integration/test_restorer_inventory.py tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/fp32-bias-server-gpu.xml
 python -m pytest tests/unit -q --device cpu --junitxml=artifacts/test-results/restorer-inventory-server-unit.xml
+```
+
+## 共用 Runtime 与 Profiler 审阅优化（2026-09-14）
+
+- 按用户要求审阅正确性、完备性和简洁性；已核对 `CLAUDE.md`、总计划、Task09/10 与当前生产者/消费者。修改前工作区干净。本次只修改 `runtime.py`、`profiler.py`、对应合同/schema 测试及本文件，没有修改模型、inventory、Planner 算法、依赖或环境。
+- 并发清理审计原先用全局 `mp.active_children()` 减启动时 baseline；关闭先启动的 runtime 时，会把仍在工作的另一个 runtime 的进程误报为泄漏。现直接根据本 runtime 持有的进程在 join/terminate/kill 后的实际 alive 状态计算 leaked PID，删除全局 baseline 和重复的 clean 判断。新增测试先关闭第一个 runtime，再验证第二个仍可应答并正常关闭。
+- 原先先提交 step、发送 commit/收取 safe 并保存结果，随后才比较 profile/读取测试快照；报告处理失败或控制器处理超过期限时，已提交步号与部分结果仍被保存。现先完成 loss/profile 检查及测试快照读取，再检查同一个硬期限，之后才确认全部 ACK 并发送 commit；只有完整结果才进入 `steps`。profile、snapshot、deadline 三项故障测试均确认 committed step=0、steps 为空且清理完成。这是 controller 提交顺序修复，不包含 worker 已执行 AdamW 的回滚或 Task12 故障恢复。
+- ACK 原先在 envelope 和嵌套 report 中各存一份 worker/step；训练函数现只生成计算报告，worker 控制循环以 committed step 推导一次 step ID，将报告写入唯一 ACK envelope。controller 使用已经验证的 envelope identity/step 构造公开报告，彻底删除旧 `reply["report"]` 路径，没有旧消息适配。新增连续3步协议测试验证样本连续、身份/步号、全部 safe ACK 与线上的扁平字段；错误 generation 和 bool step 在提交前被拒绝。
+- Profiler 原先只比较 forward/backward ID 列表相等和 kind/phase，接受了从1或7开始、有空洞、重排的 micro-batch IDs。现直接与真实调度比较完整 `(kind, micro_batch, phase)`，移除冗余 backward 列表，保留实际 pipeline 深度与既有时间/依赖校验。
+- metadata harness 只运行标准库 spawn 进程和控制协议，backend 明确为 `metadata`；不模拟训练 tensor、Gloo/NCCL 或 optimizer。其3步协议记录不能作为3步真实训练数值证据。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 修改前：`python -m pytest tests/unit/test_runtime_contracts.py tests/integration/test_profile_roundtrip.py -q --device cpu -k 'claim_second or report_failure or gapped_or_reordered' --tb=short --junitxml=artifacts/test-results/runtime-review-before.xml` | 1 | 8 failed / 91 deselected；复现并发清理1项、提交时序3项、trace ID 4项 |
+| 修正后同一选择，报告 `runtime-review-fixed.xml` | 0 | 8 passed / 91 deselected |
+| `python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py tests/integration/test_profile_roundtrip.py -q --device cpu -k 'not live_profile_roundtrip' --tb=short --junitxml=artifacts/test-results/runtime-review-focused.xml` | 0 | 125 passed / 1 deselected；其中共用 runtime/topology 合同68项 |
+| 合同/调度/Estimator/Planner/state-source/Hungarian/DSATUR/selector/oracle/profile schema 组合，完整命令保存在 `runtime-review-local-summary.json` | 0 | 871 passed / 1 deselected / 0 failures / 0 errors / 0 skipped；包含上述125项，不代表另新增871项 |
+| `python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cpu --world-size 7 --tb=short --junitxml=artifacts/test-results/runtime-review-dynamic-cpu.xml` | 1 | 16 setup errors，全部缺 torch，未启动真实训练 worker |
+| `python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/runtime-review-symmetric-cpu.xml` | 1 | 17 setup errors，全部缺 torch，未启动真实训练 worker |
+| `python -m compileall -q src tests`；`git diff --check`；最终diff/旧路径/实际JUnit与协议资源审计核对 | 0 | 通过；没有安装或执行未声明工具 |
+
+- 报告位于 `artifacts/test-results/runtime-review-{before|fixed|focused|regression|dynamic-cpu|symmetric-cpu}.log/.xml` 与 `runtime-review-local-summary.json`。修正后 focused/regression 各16份协议 runtime JSON 全部 clean、无 alive/leaked PID、rendezvous 目录已删除；正常退出 worker code=0，故障注入走终止清理。这些审计不代表真实训练资源验收。
+- 本机仍为 Windows/Python3.13.12/pytest9.1.1，缺少 torch；未安装/修改环境、访问服务器或执行GPU。唯一 deselected 为需要 torch 的真实 profile roundtrip。真实CPU/GPU的数值、P2P、异步AllReduce、Profiler和资源清理仍待指定环境复验，Task09/10验收状态不变。
+
+固定容器复验入口（既有 python，从项目工作目录执行）：
+
+```bash
+python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py tests/integration/test_profile_roundtrip.py -q --device cpu --junitxml=artifacts/test-results/runtime-review-server-contracts.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --junitxml=artifacts/test-results/runtime-review-server-symmetric-cpu.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cpu --world-size 7 --junitxml=artifacts/test-results/runtime-review-server-dynamic-cpu.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/runtime-review-server-symmetric-gpu.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/runtime-review-server-dynamic-gpu.xml
 ```
 
 ## 每次完成小功能的记录格式

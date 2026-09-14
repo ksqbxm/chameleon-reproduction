@@ -393,8 +393,7 @@ def _train_worker_step(topology, rank, model, optimizer, pp_group, owner_groups,
         optimizer.step()
         _synchronize(device)
     completed_s = time.monotonic() - origin
-    report = {"worker": asdict(topology.ranks[rank]), "pid": os.getpid(),
-              "pipeline": pipeline, "stage": stage, "step_id": step_id,
+    report = {"pid": os.getpid(), "pipeline": pipeline, "stage": stage,
               "sample_ids": [sample_id for batch in batches for sample_id in batch],
               "micro_batches": [list(batch) for batch in batches], "trace": trace,
               "communication": communication, "synchronized_parameters": synced,
@@ -487,14 +486,15 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
                 raise RuntimeError("injected runtime worker failure")
             if rank == 0 and behavior == "hang":
                 time.sleep(3600)
-            capture_path = (str(Path(directory) / f"step-{committed.committed_global_step + 1}-rank-{rank}.pt")
+            step_id = committed.committed_global_step + 1
+            capture_path = (str(Path(directory) / f"step-{step_id}-rank-{rank}.pt")
                             if capture_state else None)
             report = _train_worker_step(topology, rank, model, optimizer, pp_group, owner_groups,
                                         committed, profiler, origin, capture_path)
-            _write_reply(connection, directory, rank, "ack", identity, step_id=report["step_id"], report=report)
+            _write_reply(connection, directory, rank, "ack", identity, step_id=step_id, **report)
             if connection.recv_bytes(maxlength=7) != b"commit":
                 raise RuntimeError("worker requires controller commit after optimizer acknowledgement")
-            committed = replace(committed, committed_global_step=report["step_id"])
+            committed = replace(committed, committed_global_step=step_id)
             if profiler is None:
                 options = (dict(pp_size=topology.pp_size) if isinstance(topology, SymmetricTopology)
                            else dict(pp_size=max(topology.pipeline_lengths), pipeline_lengths=topology.pipeline_lengths))
@@ -592,12 +592,15 @@ class SymmetricRuntime:
             self.close(str(exc))
             raise RuntimeErrorWithAudit(str(exc), self.audit) from exc
 
+    def _check_deadline(self, kind, deadline):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"runtime {kind} exceeded hard timeout {self.timeout_s}s")
+
     def _collect(self, kind, deadline):
         pending = set(range(len(self.connections)))
         result = {}
         while pending:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"runtime {kind} exceeded hard timeout {self.timeout_s}s")
+            self._check_deadline(kind, deadline)
             if any(p.exitcode not in (None, 0) for p in self.processes):
                 raise RuntimeError("runtime worker exited abnormally")
             pipes = [self.connections[rank] for rank in sorted(pending)]
@@ -620,14 +623,12 @@ class SymmetricRuntime:
                 message.update(worker=worker, received_s=received_s)
                 result[rank] = message
                 pending.remove(rank)
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"runtime {kind} exceeded hard timeout {self.timeout_s}s")
+        self._check_deadline(kind, deadline)
         return [result[rank] for rank in sorted(result)]
 
     def __enter__(self):
         if self._closed or self._directory is not None:
             raise RuntimeError("runtime can only be opened once")
-        self.baseline = {p.pid for p in mp.active_children()}
         self.origin = time.monotonic()
         with self._abort_on_error():
             self.root.mkdir(parents=True, exist_ok=True)
@@ -662,7 +663,8 @@ class SymmetricRuntime:
             for connection in self.connections:
                 connection.send_bytes(b"step")
             replies = self._collect("ack", deadline)
-            reports = [reply["report"] for reply in replies]
+            reports = [dict({key: value for key, value in reply.items() if key not in ("kind", "received_s")},
+                            worker=asdict(reply["worker"])) for reply in replies]
             accounting = GlobalBatchAccounting(self.state, expected_owners={
                 row["worker"].worker_id: set(row["parameter_names"]) for row in self.ready})
             for report in reports:
@@ -675,6 +677,12 @@ class SymmetricRuntime:
                    or not math.isclose(report["loss_global_sum"], loss.loss_global_sum, rel_tol=rtol, abs_tol=atol)
                    for report in reports):
                 raise RuntimeError("worker global SUM does not match sample accounting")
+            comparison = compare_runtime_profile(reports, self.topology)
+            if self.capture_state:
+                import torch
+                snapshots = [torch.load(self.directory / f"step-{step_id}-rank-{rank}.pt", weights_only=True)
+                             for rank in range(len(self.topology.ranks))]
+            self._check_deadline("step", deadline)
             commits = []
             for reply in replies:
                 before = self.state.committed_global_step
@@ -688,13 +696,11 @@ class SymmetricRuntime:
             result = {"step_id": step_id, "sample_ids": list(sample_ids),
                       "loss_global_sum": loss.loss_global_sum, "global_sample_count": loss.global_sample_count,
                       "loss_global_mean": loss.loss_global_mean, "commits": commits, "reports": reports,
-                      "profile_comparison": compare_runtime_profile(reports, self.topology),
+                      "profile_comparison": comparison,
                       "safe_worker_ids": [reply["worker"].worker_id for reply in safe]}
-            self.steps.append(result)
             if self.capture_state:
-                import torch
-                result["snapshots"] = [torch.load(self.directory / f"step-{step_id}-rank-{rank}.pt", weights_only=True)
-                                       for rank in range(len(self.topology.ranks))]
+                result["snapshots"] = snapshots
+            self.steps.append(result)
             return result
 
     def snapshot_profiles(self):
@@ -748,15 +754,14 @@ class SymmetricRuntime:
                 if not process.is_alive():
                     process.close()
             self._directory.cleanup()
-        leaked = sorted({p.pid for p in mp.active_children()} - self.baseline)
+        leaked = sorted(worker["pid"] for worker in workers if worker["alive"])
         self.audit = {"workers": workers, "leaked_pids": leaked,
                       "rendezvous_file": str(self.rendezvous_file),
                       "rendezvous_file_removed": not self.rendezvous_file.exists(),
                       "rendezvous_dir": str(self.directory), "rendezvous_removed": not self.directory.exists(),
                       "committed_global_step": self.state.committed_global_step, "error": error,
                       "device": self.device, "backend": self.backend}
-        self.audit["clean"] = (not leaked and not self.directory.exists()
-                               and all(not worker["alive"] for worker in workers))
+        self.audit["clean"] = not leaked and not self.directory.exists()
         if not self.audit["clean"]:
             error = self.audit["error"] = f"runtime resource cleanup failed; original error: {error}"
             close_failed = True

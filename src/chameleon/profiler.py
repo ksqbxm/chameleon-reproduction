@@ -383,10 +383,9 @@ def _validate_trace(trace, parallel):
         raise ValueError("trace contains missing backward operations")
     for (pipeline, stage), operations in stages.items():
         forwards = [r["micro_batch"] for r in operations if r["kind"] == "forward"]
-        backwards = [r["micro_batch"] for r in operations if r["kind"] == "backward"]
         queue = build_1f1b_schedule(_pipeline_depth(parallel, pipeline), len(forwards))[stage]
-        expected = [(op.kind, op.phase) for op in queue]
-        if forwards != backwards or [(r["kind"], r["phase"]) for r in operations] != expected:
+        expected = [(op.kind, op.micro_batch, op.phase) for op in queue]
+        if [(r["kind"], r["micro_batch"], r["phase"]) for r in operations] != expected:
             raise ValueError("trace must follow actual 1F1B warmup/steady/cooldown order")
 
 

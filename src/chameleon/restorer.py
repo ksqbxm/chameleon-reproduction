@@ -12,6 +12,11 @@ from .state_sources import StateSourceMap, StateTensor
 from .transfer_calibration import calibration_times_s
 
 
+def synchronization_rounds(unit_devices):
+    """Shared deterministic module rounds for manifests and real owner SUMs."""
+    return dsatur(conflict_graph(unit_devices))
+
+
 @dataclass(frozen=True)
 class TargetSlot:
     pipeline: int
@@ -174,7 +179,7 @@ class Restorer:
         migration_rounds = tuple(tuple(migrations[key] for key in row) for row in dsatur(transfer_graph))
         owners = {module: tuple(worker.worker_id for slot, worker in assignments if module in slot.modules)
                   for module in modules}
-        synchronization_rounds = dsatur(conflict_graph(owners))
+        sync_rounds = synchronization_rounds(owners)
         held = tuple((i.worker, t) for i in sources.inventories for t in sorted(i.tensors, key=lambda t: t.key))
         target_state = {(a.destination, a.tensor) for a in actions}
         release = tuple(pair for pair in held if pair not in target_state)
@@ -183,7 +188,7 @@ class Restorer:
                                           "committed_global_step": state.committed_global_step,
                                           "actions": tuple(asdict(action) for action in actions)})
         return MigrationManifest(manifest_id, dynamic, assignments, costs, matching.total_cost, tuple(actions),
-                                 migration_rounds, synchronization_rounds, held, release)
+                                 migration_rounds, sync_rounds, held, release)
 
     def estimate_transition(self, manifest: MigrationManifest, *,
                             unoverlapped_search_time_s: float) -> TransitionEstimate:

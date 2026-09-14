@@ -113,3 +113,42 @@ def symmetric_training(request):
 def pytest_terminal_summary(terminalreporter):
     for path in sorted(terminalreporter.config._chameleon_reports):
         terminalreporter.write_line(f"{path}:\n{path.read_text(encoding='utf-8')}")
+
+
+@pytest.fixture(scope="module")
+def asymmetric_training(request):
+    """Task10 initial topology only; three real SUM/AdamW steps and live profiles."""
+    import torch
+    from chameleon import ClusterState, ModelConfig, WorkerIdentity
+    from chameleon.environment import environment_report, validate_container
+    from chameleon.model import build_initial_model
+    from chameleon.reference import ReferenceTrainer
+    from chameleon.runtime import DynamicTopology, SymmetricRuntime
+
+    device = request.config.getoption("--device")
+    size = 8 if device == "cuda" else 7
+    if request.config.getoption("--world-size") != size:
+        pytest.fail(f"Task10 acceptance requires --world-size {size} on {device}")
+    if device == "cuda":
+        validate_container(environment_report())
+    config = ModelConfig(vocab_size=7, hidden_size=4, num_layers=2, num_heads=1,
+                         sequence_length=3, global_batch_size=19, micro_batch_size=2)
+    short = (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head"))
+    long = (("embedding",), ("blocks.0",), ("blocks.1", "final_norm", "lm_head"))
+    other_long = (("embedding", "blocks.0"), ("blocks.1",), ("final_norm", "lm_head"))
+    layouts = (short, long, other_long) if device == "cuda" else (short, short, long)
+    workers = tuple(WorkerIdentity(f"asymmetric-{20 - r}", r, 2) for r in reversed(range(size)))
+    topology = DynamicTopology(ClusterState(workers, 19, generation=2), config, layouts, (5, 3, 2))
+    runtime = SymmetricRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
+    with runtime:
+        steps = [runtime.train_step() for _ in range(3)]
+        profiles = runtime.snapshot_profiles()
+        assert runtime.state.committed_global_step == 3
+    assert runtime.audit["clean"]
+    assert all(w["exitcode"] == 0 for w in runtime.audit["workers"])
+    request.config._chameleon_reports.add(runtime.report_path)
+    torch.set_num_threads(1)
+    reference = ReferenceTrainer(build_initial_model(config, device=device),
+                                 ClusterState((WorkerIdentity("reference", 0, 0),), 19), lr=.007, weight_decay=.125)
+    return dict(runtime=runtime, topology=topology, config=config, steps=steps,
+                profiles=profiles, reference=[reference.train_step() for _ in range(3)], device=device)

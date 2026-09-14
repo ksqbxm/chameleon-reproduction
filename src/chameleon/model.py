@@ -58,6 +58,13 @@ class TinyTransformer(nn.Module):
         return self.lm_head(self.final_norm(hidden))
 
 
+def _to_initial_device(model: nn.Module, device, dtype):
+    # Full batches and micro-batches must both use full FP32 matmul precision.
+    if dtype == torch.float32 and torch.device(device).type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+    return model.to(device=device, dtype=dtype)
+
+
 def build_initial_model(config: ModelConfig, *, device: str = "cpu",
                         dtype: torch.dtype = torch.float64) -> TinyTransformer:
     """Seed only initial construction; training and topology changes never call this."""
@@ -65,7 +72,7 @@ def build_initial_model(config: ModelConfig, *, device: str = "cpu",
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(config.seed)
         model = TinyTransformer(config)
-    return model.to(device=device, dtype=dtype)
+    return _to_initial_device(model, device, dtype)
 
 
 class PipelineStage(nn.Module):
@@ -98,4 +105,4 @@ def build_initial_stage(config: ModelConfig, module_ids: tuple[str, ...], *,
                         device: str = "cpu", dtype: torch.dtype = torch.float64) -> PipelineStage:
     """Initial startup only; discard unowned CPU modules before moving to the device."""
     stage = PipelineStage(build_initial_model(config), module_ids)
-    return stage.to(device=device, dtype=dtype)
+    return _to_initial_device(stage, device, dtype)

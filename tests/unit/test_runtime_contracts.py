@@ -121,17 +121,68 @@ def test_runtime_cannot_reenter_or_reopen_before_resource_allocation(metadata_ru
         runtime.__enter__()
 
 
-def test_port_reservation_error_keeps_original_error_and_cleans_directory(metadata_runtime, monkeypatch):
+def test_runtime_does_not_reserve_a_tcp_port(metadata_runtime, monkeypatch):
+    from chameleon import runtime as module
+
     def fail_bind(*_):
-        raise OSError("injected port reservation failure")
+        raise OSError("TCP ports are unavailable")
 
     monkeypatch.setattr(socket.socket, "bind", fail_bind)
-    with pytest.raises(RuntimeErrorWithAudit, match="injected port reservation failure") as caught:
+    monkeypatch.setattr(module, "_runtime_worker", partial(_metadata_worker, fault="none"))
+    with metadata_runtime:
+        assert metadata_runtime.snapshot_profiles() == [None] * 4
+    assert metadata_runtime.audit["clean"]
+    assert metadata_runtime.audit["rendezvous_removed"]
+
+
+def test_directory_creation_error_keeps_original_error_without_starting_workers(metadata_runtime, monkeypatch):
+    def fail_mkdir(*_, **__):
+        raise OSError("injected directory creation failure")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+    with pytest.raises(RuntimeErrorWithAudit, match="injected directory creation failure") as caught:
         metadata_runtime.__enter__()
     assert isinstance(caught.value.__cause__, OSError)
     assert caught.value.audit["clean"]
     assert caught.value.audit["workers"] == []
-    assert caught.value.audit["rendezvous_removed"]
+
+
+def test_spawn_failure_cleans_workers_already_started(metadata_runtime, monkeypatch):
+    from chameleon import runtime as module
+    process_type = type(mp.get_context("spawn").Process())
+    original_start = process_type.start
+    started = []
+
+    def fail_second_start(process):
+        if started:
+            raise OSError("injected process start failure")
+        original_start(process)
+        started.append(process.pid)
+
+    monkeypatch.setattr(process_type, "start", fail_second_start)
+    monkeypatch.setattr(module, "_runtime_worker", partial(_metadata_worker, fault="none"))
+    with pytest.raises(RuntimeErrorWithAudit, match="injected process start failure") as caught:
+        metadata_runtime.__enter__()
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.audit["clean"]
+    assert [worker["pid"] for worker in caught.value.audit["workers"]] == started
+    assert metadata_runtime.audit["rendezvous_file_removed"]
+
+
+def test_concurrent_runtimes_have_independent_rendezvous_files(metadata_runtime, monkeypatch):
+    from chameleon import runtime as module
+    monkeypatch.setattr(module, "_runtime_worker", partial(_metadata_worker, fault="none"))
+    other = SymmetricRuntime(metadata_runtime.topology)
+    with metadata_runtime:
+        with other:
+            assert metadata_runtime.rendezvous_file != other.rendezvous_file
+            for runtime in (metadata_runtime, other):
+                assert {row["rendezvous_file"] for row in runtime.ready} == {str(runtime.rendezvous_file)}
+                # Control-only evidence also verifies stale store files are removed on exit.
+                runtime.rendezvous_file.write_bytes(b"metadata-only")
+                assert runtime.snapshot_profiles() == [None] * 4
+    assert all(runtime.audit["clean"] and runtime.audit["rendezvous_file_removed"]
+               for runtime in (metadata_runtime, other))
 
 
 def _collect_incomplete_frame(incoming, result, value):
@@ -197,14 +248,15 @@ def test_oversized_incomplete_control_frame_cannot_bypass_deadline():
     assert audit["exitcode"] == 0
 
 
-def _metadata_worker(value, rank, device, backend, dtype, port, timeout, connection,
+def _metadata_worker(value, rank, device, backend, dtype, rendezvous_file, timeout, connection,
                      origin, lr, weight_decay, behavior, directory, capture_state, *, fault):
     from chameleon.runtime import _write_reply
 
     worker = value.ranks[rank]
     try:
         _write_reply(connection, directory, rank, "ready", worker, pid=mp.current_process().pid,
-                     parameter_names=["protocol-only"], groups=[], device=device, backend=backend)
+                     parameter_names=["protocol-only"], groups=[], device=device, backend=backend,
+                     rendezvous_file=rendezvous_file)
         while True:
             token = connection.recv_bytes(maxlength=7)
             if token == b"stop":
@@ -234,6 +286,8 @@ def test_atomic_metadata_reply_protocol_and_cleanup(metadata_runtime, monkeypatc
             assert all((runtime.directory / f"rank-{rank}-profile.json").stat().st_size > 65536 for rank in range(4))
             assert not list(runtime.directory.glob("*.tmp"))
             assert len({row["pid"] for row in runtime.ready}) == 4
+            assert {row["rendezvous_file"] for row in runtime.ready} == {str(runtime.rendezvous_file)}
+            assert runtime.rendezvous_file.parent == runtime.directory
         assert all(row["exitcode"] == 0 for row in runtime.audit["workers"])
     else:
         match = {"partial": "hard timeout", "identity": "identity", "step": "step_id must be an integer"}[fault]
@@ -244,6 +298,8 @@ def test_atomic_metadata_reply_protocol_and_cleanup(metadata_runtime, monkeypatc
     assert runtime.state.committed_global_step == 0
     assert runtime.audit["clean"]
     assert runtime.audit["backend"] == "metadata"
+    assert runtime.audit["rendezvous_file_removed"]
+    assert not any(key.startswith("port") for key in runtime.audit)
     assert len(runtime.audit["workers"]) == 4
     assert json.loads(runtime.report_path.read_text(encoding="utf-8"))["audit"] == runtime.audit
 

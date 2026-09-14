@@ -87,6 +87,42 @@ def test_initial_seed_is_repeatable_and_preserves_rng(model_config, torch_module
     assert not torch.equal(first.embedding.weight, different.embedding.weight)
 
 
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_fp32_initializers_enforce_full_cuda_matmul_precision(torch_module, device, model_config, monkeypatch, partitioned):
+    from chameleon.model import build_initial_model, build_initial_stage
+    torch = torch_module
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    model = (build_initial_stage(model_config, ("embedding", "blocks.0"), device=device, dtype=torch.float32)
+             if partitioned else build_initial_model(model_config, device=device, dtype=torch.float32))
+    assert all(p.dtype == torch.float32 and p.device.type == device for p in model.parameters())
+    assert torch.backends.cuda.matmul.allow_tf32 == (device != "cuda")
+
+
+def test_fp32_full_batch_matches_partitioned_micro_batch_gradients(torch_module, device, monkeypatch):
+    from chameleon.data import make_batch
+    from chameleon.model import build_initial_model, build_initial_stage
+    from chameleon.reference import sample_losses
+    torch = torch_module
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    config = ModelConfig(vocab_size=7, hidden_size=4, num_layers=2, num_heads=1,
+                         sequence_length=3, global_batch_size=8, micro_batch_size=2)
+    full = build_initial_model(config, device=device, dtype=torch.float32)
+    first = build_initial_stage(config, ("embedding", "blocks.0"), device=device, dtype=torch.float32)
+    last = build_initial_stage(config, ("blocks.1", "final_norm", "lm_head"), device=device, dtype=torch.float32)
+    batch = make_batch(tuple(range(8)), config, device=device)
+    sample_losses(full(batch.inputs), batch.targets).sum().backward()
+    for left in range(0, 8, 2):
+        activation = first(batch.inputs[left:left + 2])
+        received = activation.detach().requires_grad_()
+        sample_losses(last(received), batch.targets[left:left + 2]).sum().backward()
+        activation.backward(received.grad)
+    expected = dict(full.named_parameters())
+    for stage in (first, last):
+        for name, parameter in stage.named_parameters():
+            torch.testing.assert_close(parameter.grad / 8, expected[name].grad / 8,
+                                       rtol=1e-4, atol=1e-6, msg=lambda message: f"{name}: {message}")
+
+
 @pytest.mark.parametrize("shape", [(4,), (2, 3), (1, 2, 4)])
 def test_forward_rejects_wrong_sequence_shape(model, torch_module, device, shape):
     with pytest.raises(ValueError, match="sequence length"):

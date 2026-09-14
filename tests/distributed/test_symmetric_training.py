@@ -7,6 +7,23 @@ from chameleon import ClusterState, ModelConfig, WorkerIdentity
 from chameleon.runtime import RuntimeErrorWithAudit, SymmetricRuntime, SymmetricTopology
 
 
+def assert_p2p_warmup(runtime):
+    config = runtime.topology.config
+    shape = [min(config.micro_batch_size, config.global_batch_size), config.sequence_length, config.hidden_size]
+    element_size = 4 if runtime.dtype == "float32" else 8
+    for ranks in runtime.topology.pipeline_ranks:
+        for stage, rank in enumerate(ranks):
+            peers = set(ranks[max(0, stage - 1):stage] + ranks[stage + 1:stage + 2])
+            rows = runtime.ready[rank]["p2p_warmup"]
+            assert Counter((row["action"], row["peer_rank"]) for row in rows) == Counter(
+                (action, peer) for peer in peers for action in ("send", "recv"))
+            for row in rows:
+                assert row["shape"] == shape
+                assert row["tensor_bytes"] == shape[0] * shape[1] * shape[2] * element_size
+                assert row["device"] == (f"cuda:{rank}" if runtime.device == "cuda" else "cpu")
+                assert row["value"] == (rank if row["action"] == "send" else row["peer_rank"]) + 1
+
+
 def assert_numerical_step(actual, expected, device, *, fp32=False):
     import torch
 
@@ -73,6 +90,7 @@ def test_all_parameters_gradients_and_adamw_match_three_fp64_steps(symmetric_tra
 
 def test_real_pids_stable_identity_and_owner_groups(symmetric_training):
     runtime = symmetric_training["runtime"]
+    assert_p2p_warmup(runtime)
     assert len({row["pid"] for row in runtime.ready}) == 4
     assert [row["worker"].rank for row in runtime.ready] == [0, 1, 2, 3]
     assert [row["worker"].worker_id for row in runtime.ready] == ["stable-20", "stable-19", "stable-18", "stable-17"]
@@ -153,6 +171,9 @@ def test_small_schedules_and_fp32_smoke(distributed_environment, device, world_s
     runtime = SymmetricRuntime(topology, device=device, dtype=dtype, capture_state=True)
     with runtime:
         actual = runtime.train_step()
+    assert_p2p_warmup(runtime)
+    if case == "fp32" and device == "cuda":
+        assert all(row["float32_matmul_precision"] == "highest" for row in runtime.ready)
     reference = ReferenceTrainer(build_initial_model(config, device=device, dtype=getattr(torch, dtype)),
                                  ClusterState((WorkerIdentity("reference", 0, 0),), batch))
     assert_numerical_step(actual, reference.train_step(), device, fp32=case == "fp32")

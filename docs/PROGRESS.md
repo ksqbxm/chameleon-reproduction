@@ -4,6 +4,8 @@
 
 Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/Estimator/Restorer 组合已实现并审阅修正；本机指定 CPU 组合 108 passed，合同及 Task05–08 算法回归 746 passed。固定容器复验待执行；受影响真实 inventory/校准补测为 39 passed / 22 errors（缺 torch），真实训练中的策略切换按总计划在 Task13 验证。
 
+Task 10 的非对称新建 topology、逐参数 owner groups、DSATUR 异步 SUM、Planner/Restorer scheduling 接入与验收测试已实现。相关合同/算法/profile schema 回归 857 passed；指定真实 CPU 组合 16 setup errors（缺 torch），GPU 未执行。不能标为完成或“CPU 已验”；状态迁移恢复仍在 Task 12。
+
 ## 状态
 
 | Task | 状态 | 实际测试 |
@@ -16,8 +18,9 @@ Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/E
 | 06 | 已实现并审阅修正；本机 CPU oracle 已验；固定容器待复验 | 审阅后指定四文件 288 passed；调度/Estimator 回归 161 passed；无失败或跳过；本 task 不要求独立 GPU 测试 |
 | 07 | 已审阅并修正 plan/estimate/ACK 绑定与 transition 计费；指定 CPU oracle 已验；固定容器与真实路径待验 | 指定四文件 135 passed；Task05/06/07 算法组合 584 passed；真实 inventory/校准/profile 回归 101 passed / 41 errors（缺 torch）；实际通信在 10/12 |
 | 08 | 已实现并审阅修正；本机 CPU 算法组合已验；固定容器与真实路径待验 | 指定两文件 108 passed；合同及 Task05–08 算法回归 746 passed；真实 inventory/校准补测 39 passed / 22 errors（缺 torch）；真实策略切换在 13 |
-| 09 | 已审阅并修正控制消息阻塞、生命周期/早期清理与重复 profile 历史；合同/协议/算法回归已验；真实 CPU/GPU 待验 | 最新合同34 passed，相关回归357 passed；含标准库协议子进程清理；指定训练组合17 setup errors（缺 torch），0 skipped；GPU未执行 |
-| 10-15 | 待实施 | 未执行 |
+| 09 | 已根据服务器报错修正 rendezvous 竞态、首次双向 P2P 连接与 FP32 精度，并重构共用 runtime；真实 CPU/GPU 待复验 | 用户回传 GPU 10 passed / 3 failed / 4 errors；修改后本机共用合同61 passed、相关回归444 passed；CPU 训练/模型27 setup errors（缺 torch）；GPU配置阶段因缺 torch 退出 |
+| 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 历史回归857 passed；最新共用合同61 passed、相关回归444 passed；指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
+| 11-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -637,6 +640,85 @@ python -m pytest tests/distributed/test_symmetric_training.py tests/integration/
 - 实际环境仍为 Windows/Python3.13.12/pytest9.1.1，缺少 torch，非固定目标容器。没有安装/改变环境、访问服务器、运行 GPU 或真实训练 kill。CPU/Gloo 数值/P2P/Profiler 与4 GPU FP64/FP32/NCCL，以及去除冗余同步后的真实 trace，仍须目标环境验证；不能标 Task09 完成或“CPU已验”。
 
 固定容器验收命令继续使用上一节三个 server 命令，其中新增合同当前为34项。用户回传实际训练日志、JUnit 和 runtime JSON 后再确认验收状态。
+
+## Task 10 实现与开发验证（2026-09-14）
+
+- 已阅读 `CLAUDE.md`、总计划、Task09/10、进度和已有 Runtime、Profiler、Estimator、Planner、Restorer、模型、数据与分布式测试；仓库及祖先目录没有额外 AGENTS.md。按用户要求继续实现 Task10；Task09 的真实 CPU/GPU 待验状态不变。修改前 Git 工作区干净。
+- 修改范围：`src/chameleon/runtime.py`、`profiler.py`、`restorer.py`；`tests/conftest.py`、`tests/integration/test_profile_roundtrip.py`；新增 `tests/unit/test_dynamic_runtime_contracts.py`、`tests/distributed/test_asymmetric_training.py`、`test_colored_allreduce.py`、`tests/integration/test_planner_runtime.py`；以及本进度文件。没有修改依赖、环境、总计划或其他 task 文档。
+- `DynamicTopology` 支持每条 pipeline 独立的完整有序 layout、正整数 micro-batch 数和实际 worker/stage 映射，检查端点、dense ranks、固定 B、全局 Nm 和唯一 worker 覆盖。CPU 验收长度 [2,2,3]，GPU [2,3,3]；主验收 B=19、micro=2、Nm=10、分配 [5,3,2]，对应样本数 [10,6,3]，最后 micro-batch 为1个样本。连续 IDs 仅由 committed step 推导。
+- 复用现有 `SymmetricRuntime` 的唯一 worker、P2P、1F1B、控制协议、StepCommit 与 finally 清理路径；该 runtime 现在接受对称和 dynamic topology，没有另建执行器或兼容 adapter。stage 从显式映射寻找前后 peer，按真实 pipeline 深度和本地 micro-batch 数运行1F1B；支持 Restorer 分配后不连续、非单调的物理 ranks。controller 不构造初始完整模型。
+- 全 rank 按统一顺序创建、预热 PP groups 和参数 owner groups。具有相同 owners 的参数复用同一个实际 communicator，每个 trainable parameter 都有 owner 映射。Restorer manifest 与 Runtime 共享 DSATUR scheduling；每轮设备最多持有一个 module，实际对该 module 的全部参数发起 `all_reduce(SUM, async_op=True)`，等待本轮全部 Work 并同步 CUDA 后进入下一轮。不同 pipeline 完成 P2P 后统一进入归约，轮间 barrier 保证全局顺序。局部 backward 仅 SUM，owner SUM 后仅除一次 global sample count，再执行 AdamW。
+- 归约审计包含逐参数 module、实际 process-group ranks、color、SUM/divisor、async 标志、device/backend、字节和 launch/completion 时间。检查本地全部 trainable 参数恰好同步一次；测试同时覆盖 embedding、blocks、final norm 和 head。NCCL 多 group 的创建/异步等待次序参考 [PyTorch2.8 官方分布式文档](https://docs.pytorch.org/docs/2.8/distributed.html#groups)；没有引入新库或 CPU fallback。
+- Profiler version3 的 parallel identity 对非对称布局增加 `pipeline_lengths`，pp_size 表示最大深度，rank 上界使用真实 worker 总数；每条 trace 按自身 pipeline 深度检查 stage 与 FIFO/warmup/steady/cooldown。对称 profile 继续使用原对称字段。Eq.11 使用每 pipeline 的真实深度、micro-batch 数和实测 operation scopes；Eq.10 取最大 pipeline 时间。非对称路径不使用 Eq.9 的对称假设；另保留各 pipeline 实测完成时间和包含 P2P/SUM/AdamW 的实际训练时间。
+- `DynamicTopology.from_plan` 检查 plan 可行性及 profile/config identity，并接受 Restorer 的完整 TargetSlot/worker assignments。集成测试用真实独立训练生成 Profiler 数据和完整 AdamW inventory 元数据，经过 Estimator→Planner→Hungarian/DSATUR manifest 启动新的 topology；覆盖普通 Nm10 和包含零分区修复的 Nm3→[1,1,1]，后者真实执行单 micro-batch、少于 PP 深度和 partial batch。prototype tensor 值不传给 Restorer/Runtime，启动后的3步另与初始 single-process reference 比较。这是新建 topology 验证，没有执行迁移、旧训练续跑或故障恢复；Task12 才实现完整状态恢复。
+- 验收测试包含至少3步 FP64 全参数/梯度/AdamW 对照、不等样本与 partial micro-batch、错误的“pipeline means 再平均”在各 module 梯度上与 reference 不同、真实 FIFO/跨 worker 依赖、P2P shape/peer/device、持久 PID、全部 worker ACK 后提交、实际 owner group/color 轮次和归约覆盖、profile JSON roundtrip、独立依赖 recurrence 对照 Eq.11/max、FP32 smoke、异常/硬超时清理。默认生产模式继续仅保存 metadata/profile，tensor captures 只作为测试证据，不是恢复源。
+
+实际命令与结果（均从项目工作目录运行）：
+
+| 阶段 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 初版：`python -m pytest tests/unit/test_dynamic_runtime_contracts.py tests/unit/test_runtime_contracts.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task10-topology-before.xml` | 1 | 49 passed / 1 failed；非对称 profile 比较仍访问统一 pp_size，修改后消除该路径 |
+| 拓扑/调度组合：`python -m pytest tests/unit/test_dynamic_runtime_contracts.py tests/unit/test_runtime_contracts.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task10-topology.xml` | 0 | 初版110 passed；补充 plan/assignment/profile 合同后同路径 `task10-contracts.xml` 为118 passed |
+| Profiler 回归：`python -m pytest tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task10-profiler.xml` | 1 | 62 passed / 16 setup errors，全部缺 torch |
+| 上述118项组合另加 `tests/integration/test_profile_roundtrip.py`，报告 `task10-focused.xml` | 1 | 171 passed / 1 setup error，缺 torch；其中 schema roundtrip 已验，真实 roundtrip 未验 |
+| 最终合同：`python -m pytest tests/unit/test_dynamic_runtime_contracts.py tests/unit/test_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/task10-final-contracts.xml` | 0 | 58 passed / 0 failures / 0 errors / 0 skipped |
+| 相关合同/调度/Estimator/Planner/state-source/Hungarian/DSATUR/selector/oracle/profile schema 回归，完整命令保存在 `artifacts/test-results/task10-local-summary.json` | 0 | 857 passed / 1 deselected / 0 failures / 0 errors / 0 skipped；显式不选择需要 torch 的真实 profile roundtrip，此结果不代表真实训练通过 |
+| `python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cpu --world-size 7 --tb=short --junitxml=artifacts/test-results/task10-cpu.xml` | 1 | 16 setup errors / 0 failures / 0 skipped，全部缺 torch，未启动训练 worker |
+| 受影响 Task09：`python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task10-symmetric-regression.xml` | 1 | 17 setup errors / 0 failures / 0 skipped，全部缺 torch |
+| `python -m compileall -q src tests`；`git diff --check`；逐文件最终 diff/import/路径审阅和实际 XML 解析 | 0 | 通过；没有执行未声明的 Ruff 或安装工具 |
+
+- 实际本机环境：Windows/Python3.13.12/pytest9.1.1，当前 Python 缺少 torch；不属于固定 Ubuntu/Python3.12.3/pytest8.1.1 GPU 容器。没有安装、升级、降级依赖，访问服务器或执行 GPU/训练 kill。
+- 报告：`artifacts/test-results/task10-{topology-before|topology|contracts|profiler|focused}.xml`；`task10-{final-contracts|regression|cpu|symmetric-regression}.log/.xml`；`task10-local-summary.json`。训练 setup 报错前没有 backend/PID/端口/rendezvous；相关合同中的标准库 metadata 子进程清理不替代真实 Gloo/NCCL 资源审计。
+- 未验证项：全部真实非对称 CPU/Gloo 数值、P2P、async SUM、Profiler/Planner Runtime 与清理；8 GPU FP64/FP32/NCCL 验收；受影响 Task09 的真实训练回归。Task10 **不能标完成或“CPU已验”**。Task11–15未实现；完整状态迁移、group 重建和真实 kill 仍按后续 task 验证。
+
+固定容器从项目工作目录使用总计划指定的既有 python 执行，无需安装项目：
+
+```bash
+python -m pytest tests/unit/test_dynamic_runtime_contracts.py tests/unit/test_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/task10-server-contracts.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cpu --world-size 7 --junitxml=artifacts/test-results/task10-server-cpu.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/task10-server-gpu.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/task10-server-symmetric.xml
+```
+
+真实训练运行会输出各 `runtime-*.json` 的 PID/group/trace/color/commit/cleanup 审计。用户回传完整日志、JUnit 和 runtime JSON 后再核对并确认验收。
+
+## Runtime 服务器报错修复与重构（2026-09-14）
+
+- 输入：用户回传 Task09 GPU 终端日志，结果10 passed / 3 failed / 4 errors。实际环境为固定 Ubuntu/Python3.12.3/Torch NGC25.06/CUDA12.9/NCCL2.27.3，8张 RTX5090可见；没有附原始 JUnit 与 runtime 清理 JSON，不能独立核对全部资源审计。报错分别是 TCPStore EADDRINUSE、single_partial 首次 P2P 的 `Message truncated : received 1024 bytes instead of 512`、less_than_depth ACK 超时，以及 FP32 embedding 梯度最大绝对差2.3807398974895477e-5，超过现有1e-6绝对容差。
+- 已重新阅读 `CLAUDE.md`、总计划、Task09、当前 runtime 和相关模型/参考/调度/归约/测试，未发现额外仓库或祖先 AGENTS.md。开始时工作区已有 Task10 未提交实现；保留这些修改。本次修改限于 runtime、model、runtime 合同、模型与对称/非对称验收测试及本文件，没有改动其他算法、环境或依赖。
+- Rendezvous 根因：controller 先获取临时 TCP port 再释放，真实 worker 延迟启动 TCPStore，期间没有 port 所有权。现单机 spawn 唯一采用各 runtime 临时目录内独占的新 `dist.FileStore`，目录创建后才 spawn，worker 共享同一路径；最终清理检查 store file 与目录均已删除。彻底删除 runtime 的 port 参数、TCP 初始化、socket reservation/probe、port audit 字段；更新全部共用 runtime 消费者，没有 TCP fallback、重试或旧字段 alias。
+- NCCL 连接根因：single micro-batch 的一端首次 grouped P2P 同时 send activation/recv gradient，另一端首次只 recv activation。NCCL2.27.3 的 transport setup 交换 send/recv channel 的连接信息，方向集合不对称可产生2倍信息大小或互等；原 AllReduce 仅预热 collective，未初始化这些 P2P transport。[NCCL transport 源码](https://github.com/NVIDIA/nccl/blob/v2.27.3-1/src/transport.cc#L151)、[bootstrap 大小校验](https://github.com/NVIDIA/nccl/blob/v2.27.3-1/src/bootstrap.cc#L199)。现所有 pipeline 成员在进入训练前，按全局 source/target 顺序同时建立每条相邻 stage 边的双向 P2P，使用最大实际 activation/gradient 形状与训练 dtype，等待全部 Work、同步 CUDA 并核对接收值；PP1 无相邻边。ready 报告保存实际 device、peer、shape、bytes和值。主验收、单/少 micro-batch、FP32、非对称布局均检查这些记录。
+- CUDA `init_process_group` 显式绑定 `device_id=cuda:rank`，让 NCCL 默认 communicator 在启动时建立，子 group 继承设备；保留每组全局统一创建/预热次序与通信完成同步。[PyTorch2.8 初始化说明](https://docs.pytorch.org/docs/2.8/distributed.html#torch.distributed.init_process_group)。CPU仍为真实 Gloo，GPU训练/P2P/SUM仍为真实NCCL，FileStore只负责连接元数据。
+- FP32：NGC/CUDA 不同 batch 形状可选择不同计算路径；当前超差怀疑与 TF32 精度有关，日志没有记录旧 allow_tf32 状态，尚不能认定为已由服务器数值实验证实的唯一原因。完整初始模型与初始 stage 现在共用设备/dtype 转换，CUDA FP32 明确关闭 matmul TF32；worker ready 记录实际 float32 matmul precision，FP32验收要求 highest。增加独立的 full-batch 与拆分 micro-batch 全参数梯度对照、两个 initializer 精度合同；保留原 rtol/atol，没有修改 reference 使其沿用分布式微批算法，也没有增加 CPU fallback。[PyTorch2.8 数值精度说明](https://docs.pytorch.org/docs/2.8/notes/numerical_accuracy.html#tensorfloat-32-tf32-on-nvidia-ampere-and-later-devices)。FP32根因是否已消除须服务器复测确认。
+- 重构审阅：对称/dynamic 共享初始 state 校验；启动/训练/profile 导出共享唯一异常清理与 RuntimeErrorWithAudit 路径；梯度 owner/color 归约从1F1B执行中独立出来，本地参数按 module 一次分组，删除反复排序扫描与无用解包变量，仍先SUM、等待本轮全部请求、只除一次固定B，再执行AdamW。非对称 profile 删除未使用的对称 forward/backward 均值计算；不变更 FIFO、sample ID、全部 ACK 后 committed step 的语义。新增已启动部分 worker 后 spawn 失败、无可用TCP port、并发 runtime 独占 rendezvous、目录创建失败的标准库控制协议/清理回归；metadata backend 明确不执行 Gloo/NCCL 训练。
+
+实际命令与结果：
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| 修改前：`python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/runtime-fix-baseline.xml` | 0 | 58 passed |
+| 根因复现：`python -m pytest tests/unit/test_runtime_contracts.py -q --device cpu -k 'does_not_reserve_a_tcp_port or directory_creation_error' --tb=short --junitxml=artifacts/test-results/runtime-fix-before.xml` | 1 | 1 failed / 1 passed / 33 deselected；旧 runtime 仍依赖临时 port，错误为 TCP ports are unavailable |
+| `python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py -q --device cpu --tb=short --junitxml=artifacts/test-results/runtime-fix-contracts.xml` | 0 | 61 passed / 0 failures / 0 errors / 0 skipped；其中对称runtime合同37项、dynamic24项 |
+| `python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py tests/unit/test_contracts.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --tb=short --junitxml=artifacts/test-results/runtime-fix-regression.xml` | 0 | 444 passed / 0 failures / 0 errors / 0 skipped；含上述61项 |
+| 最终删除非对称冗余计算后：`python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py -q --device cpu -k 'estimate or estimator' --tb=short --junitxml=artifacts/test-results/runtime-fix-estimators.xml` | 0 | 2 passed / 59 deselected |
+| `python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py tests/unit/test_model_data.py -k 'not ids_use_only and not invalid_sample_ids' -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/runtime-fix-cpu.xml` | 1 | 27 setup errors / 5 deselected；全部缺torch，真实训练worker未启动 |
+| `python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cpu --world-size 7 --tb=short --junitxml=artifacts/test-results/runtime-fix-dynamic-cpu.xml` | 1 | 16 setup errors；全部缺torch |
+| `python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --tb=short --junitxml=artifacts/test-results/runtime-fix-gpu.xml` | 1 | 配置阶段 ERROR: No module named 'torch'；没有GPU/worker执行，也未生成GPU JUnit |
+| 两个Task09验收文件加 `tests/unit/test_model_data.py` 的 `--collect-only -q --device cpu --world-size 4`；`python -m compileall -q src tests`；`git diff --check` | 0 | 32项可发现；语法与diff检查通过，可发现性不等于训练通过 |
+
+- 实际本机仍为 Windows/Python3.13.12/pytest9.1.1，缺torch；未安装或修改环境、访问服务器、执行真实GPU/训练kill。已解析实际JUnit统计与缺torch错误；本次 FileStore 路径的标准库 metadata 审计均 clean、无遗留PID、store/目录删除，正常退出code0，故障注入worker被清理；这不是 FileStore/Gloo/NCCL 真实训练验收。报告为 `artifacts/test-results/runtime-fix-*.xml`、`runtime-fix-local-summary.json` 与各唯一 `runtime-*.json`。
+- 未验证：修改后的真实CPU/GPU全参数/梯度/AdamW数值、NCCL连接及1F1B、GPU FP32与Profiler、FileStore实际初始化/超时清理，以及Task10真实异步归约回归；Task09/10不能标完成或“CPU已验”。
+
+固定容器复测入口（项目工作目录、既有python，无需安装项目）：
+
+```bash
+python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/runtime-server-contracts.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py tests/unit/test_model_data.py -q --device cpu --world-size 4 --junitxml=artifacts/test-results/runtime-server-cpu.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py tests/unit/test_model_data.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/runtime-server-gpu.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/runtime-server-dynamic-gpu.xml
+```
+
+用户回传完整日志、JUnit 和本次新生成的 runtime JSON 后，核对实际双向warmup、FP32 precision、数值与清理，再更新验收状态。
 
 ## 每次完成小功能的记录格式
 

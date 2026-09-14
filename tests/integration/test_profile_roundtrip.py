@@ -59,6 +59,21 @@ def test_schema_json_roundtrip_is_explicit_and_lossless(schema_profile, profile_
     assert json.loads(path.read_text(encoding="utf-8")) == schema_profile
 
 
+@pytest.mark.parametrize("lengths", [[2, 2, 3], [2, 3, 3]])
+def test_asymmetric_parallel_schema_roundtrip_and_stale_depth_rejection(schema_profile, profile_directory, lengths):
+    # Schema-only fixture for Task10; real profiles run in test_planner_runtime.
+    schema_profile["identity"]["parallel"] = dict(dp_size=3, pp_size=3, rank=1, pipeline_lengths=lengths)
+    for row in schema_profile["steps"][0]["trace"]:
+        row["stage"] = 1  # Last stage of pipeline0 (PP2), F0/B0 are both steady.
+    path = profile_directory / "asymmetric.json"
+    export_profile(schema_profile, str(path), expected_identity=schema_profile["identity"])
+    assert load_profile(str(path), expected_identity=schema_profile["identity"]) == schema_profile
+    expected = deepcopy(schema_profile["identity"])
+    expected["parallel"]["pipeline_lengths"][0] = 3
+    with pytest.raises(ValueError, match="identity mismatch"):
+        load_profile(str(path), expected_identity=expected)
+
+
 @pytest.mark.parametrize("field", ["model_hash", "config_hash", "device", "parallel"])
 def test_reject_stale_identity(schema_profile, profile_directory, field):
     path = profile_directory / "profile.json"

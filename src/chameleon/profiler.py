@@ -37,14 +37,14 @@ def _hash(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def profile_identity(model, *, dp_size: int = 1, pp_size: int = 1, rank: int = 0) -> dict:
+def profile_identity(model, *, dp_size: int = 1, pp_size: int = 1, rank: int = 0,
+                     pipeline_lengths=None) -> dict:
     from .model import parameter_inventory
 
-    _integer("dp_size", dp_size)
-    _integer("pp_size", pp_size)
-    _integer("rank", rank, 0)
-    if rank >= dp_size * pp_size:
-        raise ValueError("rank must belong to the parallel configuration")
+    parallel = {"dp_size": dp_size, "pp_size": pp_size, "rank": rank}
+    if pipeline_lengths is not None:
+        parallel["pipeline_lengths"] = list(pipeline_lengths)
+    _validate_parallel(parallel)
     device = next(model.parameters()).device
     if any(t.device != device for t in (*model.parameters(), *model.buffers())):
         raise ValueError("a profiler measures one worker device")
@@ -61,7 +61,7 @@ def profile_identity(model, *, dp_size: int = 1, pp_size: int = 1, rank: int = 0
     return {"model_hash": _hash(architecture), "config_hash": _hash(asdict(model.config)),
             "module_parameter_bytes": module_bytes, "module_order": list(module_bytes),
             "device": device_identity(device),
-            "parallel": {"dp_size": dp_size, "pp_size": pp_size, "rank": rank}}
+            "parallel": parallel}
 
 
 def device_identity(device) -> dict:
@@ -114,10 +114,11 @@ def tensor_inventory(model, optimizer) -> dict[str, dict[str, int]]:
 
 class Profiler:
     def __init__(self, model, optimizer, *, dp_size: int = 1, pp_size: int = 1,
-                 rank: int = 0, ema_alpha: float = 0.5):
+                 rank: int = 0, ema_alpha: float = 0.5, pipeline_lengths=None):
         self.model = model
         self.optimizer = optimizer
-        self.identity = profile_identity(model, dp_size=dp_size, pp_size=pp_size, rank=rank)
+        self.identity = profile_identity(model, dp_size=dp_size, pp_size=pp_size, rank=rank,
+                                         pipeline_lengths=pipeline_lengths)
         self.device = next(model.parameters()).device
         self.measurements = Measurements(ema_alpha)
         self.steps: list[dict] = []
@@ -157,7 +158,7 @@ class Profiler:
         for name, value in (("micro_batch", micro_batch), ("pipeline", pipeline), ("stage", stage)):
             _integer(name, value, 0)
         parallel = self.identity["parallel"]
-        if pipeline >= parallel["dp_size"] or stage >= parallel["pp_size"]:
+        if pipeline >= parallel["dp_size"] or stage >= _pipeline_depth(parallel, pipeline):
             raise ValueError("operation must belong to the parallel configuration")
         key = pipeline, stage, micro_batch
         if (kind, key) in self._executed:
@@ -346,6 +347,10 @@ def _keys(value, keys, name):
         raise ValueError(f"invalid {name} fields")
 
 
+def _pipeline_depth(parallel, pipeline):
+    return parallel["pipeline_lengths"][pipeline] if "pipeline_lengths" in parallel else parallel["pp_size"]
+
+
 def _validate_trace(trace, parallel):
     if not isinstance(trace, list) or not trace:
         raise ValueError("trace must contain actual forward/backward operations")
@@ -356,7 +361,7 @@ def _validate_trace(trace, parallel):
         _keys(row, ("kind", "micro_batch", "pipeline", "stage", "phase", "start_s", "end_s"), "trace")
         for name in ("micro_batch", "pipeline", "stage"):
             _integer(name, row[name], 0)
-        if row["pipeline"] >= parallel["dp_size"] or row["stage"] >= parallel["pp_size"]:
+        if row["pipeline"] >= parallel["dp_size"] or row["stage"] >= _pipeline_depth(parallel, row["pipeline"]):
             raise ValueError("trace differs from parallel configuration")
         for name in ("start_s", "end_s"):
             _finite(name, row[name])
@@ -376,10 +381,10 @@ def _validate_trace(trace, parallel):
         stages.setdefault(key[:2], []).append(row)
     if pending:
         raise ValueError("trace contains missing backward operations")
-    for (_, stage), operations in stages.items():
+    for (pipeline, stage), operations in stages.items():
         forwards = [r["micro_batch"] for r in operations if r["kind"] == "forward"]
         backwards = [r["micro_batch"] for r in operations if r["kind"] == "backward"]
-        queue = build_1f1b_schedule(parallel["pp_size"], len(forwards))[stage]
+        queue = build_1f1b_schedule(_pipeline_depth(parallel, pipeline), len(forwards))[stage]
         expected = [(op.kind, op.phase) for op in queue]
         if forwards != backwards or [(r["kind"], r["phase"]) for r in operations] != expected:
             raise ValueError("trace must follow actual 1F1B warmup/steady/cooldown order")
@@ -403,12 +408,25 @@ def _validate_identity(identity):
             or len(order) != len(module_bytes) or set(order) != set(module_bytes)):
         raise ValueError("invalid identity module order")
     _validate_device_identity(identity["device"])
-    parallel = identity["parallel"]
-    _keys(parallel, ("dp_size", "pp_size", "rank"), "parallel configuration")
+    _validate_parallel(identity["parallel"])
+
+
+def _validate_parallel(parallel):
+    keys = ("dp_size", "pp_size", "rank")
+    if isinstance(parallel, dict) and "pipeline_lengths" in parallel:
+        keys += ("pipeline_lengths",)
+    _keys(parallel, keys, "parallel configuration")
     _integer("dp_size", parallel["dp_size"])
     _integer("pp_size", parallel["pp_size"])
     _integer("rank", parallel["rank"], 0)
-    if parallel["rank"] >= parallel["dp_size"] * parallel["pp_size"]:
+    lengths = parallel.get("pipeline_lengths", [parallel["pp_size"]] * parallel["dp_size"])
+    if not isinstance(lengths, list) or len(lengths) != parallel["dp_size"]:
+        raise ValueError("pipeline lengths must match the parallel configuration")
+    for length in lengths:
+        _integer("pipeline length", length)
+    if max(lengths) != parallel["pp_size"]:
+        raise ValueError("pp_size must be the maximum pipeline length")
+    if parallel["rank"] >= sum(lengths):
         raise ValueError("invalid parallel rank")
 
 

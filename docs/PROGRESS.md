@@ -1,6 +1,6 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。未实现分布式训练或实际状态迁移恢复，未执行真实 GPU 或训练进程 kill 测试。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。Task09 的对称分布式训练 runtime 和验收测试已实现，真实 CPU/GPU 训练因本机缺少 torch 待验；实际状态迁移恢复尚未实现，未执行真实 GPU 或训练进程 kill 测试。
 
 Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/Estimator/Restorer 组合已实现并审阅修正；本机指定 CPU 组合 108 passed，合同及 Task05–08 算法回归 746 passed。固定容器复验待执行；受影响真实 inventory/校准补测为 39 passed / 22 errors（缺 torch），真实训练中的策略切换按总计划在 Task13 验证。
 
@@ -16,7 +16,8 @@ Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/E
 | 06 | 已实现并审阅修正；本机 CPU oracle 已验；固定容器待复验 | 审阅后指定四文件 288 passed；调度/Estimator 回归 161 passed；无失败或跳过；本 task 不要求独立 GPU 测试 |
 | 07 | 已审阅并修正 plan/estimate/ACK 绑定与 transition 计费；指定 CPU oracle 已验；固定容器与真实路径待验 | 指定四文件 135 passed；Task05/06/07 算法组合 584 passed；真实 inventory/校准/profile 回归 101 passed / 41 errors（缺 torch）；实际通信在 10/12 |
 | 08 | 已实现并审阅修正；本机 CPU 算法组合已验；固定容器与真实路径待验 | 指定两文件 108 passed；合同及 Task05–08 算法回归 746 passed；真实 inventory/校准补测 39 passed / 22 errors（缺 torch）；真实策略切换在 13 |
-| 09-15 | 待实施 | 未执行 |
+| 09 | 已审阅并修正控制消息阻塞、生命周期/早期清理与重复 profile 历史；合同/协议/算法回归已验；真实 CPU/GPU 待验 | 最新合同34 passed，相关回归357 passed；含标准库协议子进程清理；指定训练组合17 setup errors（缺 torch），0 skipped；GPU未执行 |
+| 10-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -570,6 +571,72 @@ python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decis
 python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py tests/integration/test_plan_restorer.py tests/integration/test_dynamic_planner_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-review-server-cpu.xml
 python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task08-review-server-live-cpu.xml
 ```
+
+## Task 09 实现与开发验证（2026-09-14）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task09/10、既有模型、数据、StepCommit、1F1B schedule、Profiler、Estimator、环境与分布式测试。检查仓库与祖先目录，未发现额外 AGENTS.md；遵循用户提供的全局规则。修改前工作区干净。本次只新增 `src/chameleon/runtime.py`、三个 runtime 测试文件，在 `model.py` 加入本地 stage 初始构造，在 `tests/conftest.py` 加入验收 fixture，并更新本文件；依赖和环境未改动。
+- `SymmetricTopology` 校验每个 pipeline 按模型顺序包含 embedding、全部 blocks、final norm、head，dense ranks 完整覆盖 DP/PP。稳定 worker ID 与 rank、generation 分开保留；接受输入 worker 顺序与 rank 顺序不同。固定 B 按 global micro-batches 连续分给 DP pipelines；当前对称路径要求每 pipeline 的 micro-batch 数相等且非零，允许最后一个 partial micro-batch，因此各 pipeline 的 sample 数可以不同。初始启动拒绝已提交的训练状态，避免初始化冒充恢复。
+- `build_initial_stage` 仅在 worker 初始启动时调用固定 seed 的既有模型构造，再保留本 stage 模块并销毁未持有的临时 CPU 模块，之后将本地 stage 移到对应设备。保留全局 parameter/module 名称和实际模块执行顺序。每 worker 持有本地全部 trainable parameters 和 AdamW（AMSGrad=False），controller 不构造或持有初始完整模型。
+- 使用真实 multiprocessing spawn 和跨 steps 持久 PID。全 rank 按同一顺序建立 PP/DP groups，并实际执行 group SUM 预热后才开始子集 P2P。CPU 使用 Gloo；CUDA 每 rank 绑定独立 GPU，模型、activations、gradients、global loss/count、SUM 与 AdamW 都在该 GPU，使用 NCCL。核对 PyTorch2.8 官方分布式文档的批量 P2P、设备绑定与 wait 语义，没有引入新库或 fallback。
+- 训练直接执行既有 `build_1f1b_schedule`；相邻操作之间将当前 activation/gradient send 与下一操作需要的 recv 合并为 `batch_isend_irecv`，等待全部 requests 完成再继续，避免 steady phase 互相等待单独 send。首 stage 从确定性 IDs 生成 tokens，末 stage 生成同一批 IDs 的 labels 并计算 sample loss SUM；保留每 micro-batch 的本地 autograd graph，按 FIFO backward 后释放。每次真实操作记录 warmup/steady/cooldown、单机共享 monotonic 时钟的计算开始/结束；P2P 另记实际发送/接收、peer identity、shape/dtype/device、字节与等待时间。CUDA 边界同步以便跨 worker 依赖审计；不宣称该验证 runtime 的性能与论文硬件一致。
+- 所有局部 backward 仅累加 sample loss SUM 的梯度；每个 trainable parameter 在对应 stage 的 DP owners 间真实 AllReduce SUM，再只除一次固定 global samples，随后 AdamW step。global loss/count 在真实设备上单独 SUM；controller 用末 stage 的唯一 sample IDs、micro-batch loss sums 和 `GlobalBatchAccounting` 再核对总数/总和，FP64/FP32 容差遵循总计划对应精度。
+- worker 等待 optimizer/CUDA 完成后发送带完整 identity 与 step ID 的 ACK。controller 收齐并验证全 worker ACK 与 sample accounting 后，才调用 StepCommit；每次确认记录 before/after、ACK 收到时间与 commit 时间，最后一个确认才推进。worker 只接受同 topology 的新 committed state，回复 safe 后阻塞等待下一步命令；`train_step()` 收齐实际 safe replies 才返回，harness 可在此暂停。异常或 hard timeout 在确认完整前不会推进 committed step；不实现中途 optimizer 回滚或 fault recovery。
+- 第二步起将实际 forward/backward 包入既有 Profiler scopes，第一步真实更新用于 materialize AdamW，未人为填充 optimizer 或计时。每个 stage 保存唯一 version3 profile、模块 timing/memory 与真实 trace；Eq.11 从各 stage 的实测操作 scope durations 估计各 pipeline，取最大值，Eq.9 使用最大实测 stage 平均 forward/backward 的 uniform-stage 近似。另报告包含 P2P、SUM、AdamW 与 profiling 的实测 pipeline/full-step 时长；不将未建模通信或控制成本填为 0，也不要求论文性能误差百分比。集成测试另将包含全部 endpoints 的本地 module EMA 输入既有 pipeline Estimator。
+- 默认 runtime 只保留 metadata/profile。`capture_state=True` 仅用于测试：optimizer 完成后输出临时 CPU tensor 证据，比较全部 parameters、gradients、step/exp_avg/exp_avg_sq，返回测试后随 rendezvous 目录删除。此证据没有恢复读取接口、不传给 Restorer，不是磁盘 checkpoint 或 survivor state source。默认模式测试检查没有训练 tensor、model/optimizer 容器或 `.pt` 输出。
+- 所有 context 退出与 worker 异常/timeout 在 finally 中清理 groups、pipe、PID 和临时目录；controller 有 startup、每 step 和 shutdown 的硬期限，再统一 terminate/join/kill。每次独立运行生成唯一 `artifacts/test-results/runtime-*-{device}-{dtype}-{behavior}.json`，保存 worker/group 映射、trace、确认与估计报告，以及 exitcode、leaked PID、端口监听/可重用、rendezvous 删除和 committed step 审计；超时、遗留 worker 或正常退出异常均失败。
+- 新测试包含 DP2/PP2 四独立 PID、至少3步 FP64 的全部 trainable parameters/gradients/AdamW reference 对照；B=11、micro=2，两个 pipeline 分别6/5 samples，防止局部 mean；单 micro-batch 和不等样本、DP1/PP4 的 Nm2 小于深度、DP4/PP1、FP32 smoke、真实 P2P 字节/peer匹配、FIFO及跨 worker 依赖、safe pause、全 worker 提交与异常/hang 清理。reference 在 runtime 关闭后独立创建，仅作为测试数值断言；实际 trace 用独立 FIFO 顺序与 producer 结束时间断言，Eq.11 用 PP2/Nm3 手算 recurrence 对照，没有调用生产 scheduler/Estimator 生成预期结果。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 本地拓扑/ID/输入合同：`python -m pytest tests/unit/test_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/task09-contracts.xml` | 0 | 24 passed / 0 failed / 0 errors / 0 skipped；后续源码修正后同一最窄测试再次24 passed |
+| 初版指定 CPU 组合（下方同路径），`--tb=short --junitxml=artifacts/test-results/task09-cpu.xml` | 1 | 16 setup errors，均为缺 torch；之后加入默认 metadata 验证 |
+| 最终：`python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task09-cpu.xml` | 1 | 17 setup errors / 0 failures / 0 skipped；全部 `ModuleNotFoundError: No module named 'torch'`，worker 未启动 |
+| `python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_contracts.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task09-regression.xml` | 0 | 初版与最终均347 passed / 0 failed / 0 errors / 0 skipped；含新增24项，不表示真实训练验证通过 |
+| 指定两个验收文件 `--collect-only -q --device cpu --world-size 4` | 0 | 17 tests collected，仅验证可发现性 |
+| `python -m compileall -q src tests`；最终代码/路径/import审阅；`git diff --check`；标准库解析实际 JUnit | 0 | 通过；没有执行未声明的 Ruff 或安装第三方工具 |
+
+- 本机实际环境：Windows、Python3.13.12、pytest9.1.1，缺 torch；不是总计划规定的 Ubuntu/Python3.12.3/pytest8.1.1 容器。没有安装/升级/降级库、访问服务器或运行 GPU。17项训练/通信测试在 setup 阶段退出，没有 backend、worker PID、端口或 rendezvous，故真实清理审计尚未验证。
+- 报告：`artifacts/test-results/task09-contracts.xml`、`task09-cpu.log/.xml`、`task09-regression.log/.xml`、`task09-local-summary.json`。最终 XML 核对：24与347均无 failures/errors/skips，指定组合17 errors均缺torch；没有将 collect、语法、算法通过当作真实训练通过。
+- 未验证项：全部真实 CPU/Gloo 数值/P2P/Profiler/暂停与异常超时清理，以及服务器4 GPU FP64和FP32/NCCL验收。Task09 **不能标完成或“CPU已验”**。Task10–15没有实施；既有Task01–08待验项保持原状态。
+
+固定容器从项目工作目录使用总计划指定的既有 python 执行，无需安装项目：
+
+```bash
+python -m pytest tests/unit/test_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/task09-server-contracts.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --junitxml=artifacts/test-results/task09-server-cpu.xml
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/task09-server-gpu.xml
+```
+
+用户回传真实 CPU/GPU 完整日志、JUnit 和各 runtime JSON 审计后，核对3步完整状态、P2P与清理结果，再确认验收状态。
+
+## Task 09 审阅与优化（2026-09-14）
+
+- 按用户要求复核正确性、完备性和简洁性，重新阅读 `CLAUDE.md`、总计划、Task09 与全部 Task09 代码/测试，保留已有未提交实现。本次只修改 runtime、runtime 合同/训练/profile 测试、验收 fixture 与本文件；没有改动环境、依赖、其他任务算法或原模型代码。
+- 硬超时原逻辑有漏洞：`wait()` 只保证 framed Pipe 有数据可读，大 ACK 中只收到长度前缀时，`recv()` 会一直等待未完成的 body，轮询 deadline 无法执行。加入标准库 socket/spawn 复现，修改前超过硬期限。现 controller/worker 只传最长7 bytes 的固定控制 token，使用 `recv_bytes(maxlength=7)`；大 metadata/report 先写临时文件并原子 replace，完成后才通知。worker 停在报告发布中时没有 token，controller 可正常按 deadline 失败并清理；不会读取半份 JSON。移除所有旧 pickled state/ACK/report Pipe 路径，没有兼容分支或后台接收线程。
+- 生命周期原逻辑允许已关闭或已打开对象再次 `__enter__()`，重建目录/启动进程后 `_closed` 令后续 cleanup 直接跳过。现资源分配前检查只能打开一次，已打开对象不被覆盖、已关闭对象不再创建 worker。另修正早期 port reservation 失败时，cleanup 访问未初始化 port/baseline 导致覆盖原异常：baseline/origin 在分配前记录，port 初始 None，仅为实际取得的 port 做探测。测试确认保留原 OSError、无 PID、目录删除且 audit clean；没有吞掉异常。
+- 原每步 ACK 重复保存 Profiler 全部 history，controller `steps` 与最终报告形成平方增长。现每步仅含 `profile_step`（该步 trace/memory）；累计 version3 raw metrics、EMA、identity、steps 仍由 worker Profiler 持有，通过显式安全点 `snapshot_profiles()` 导出，controller 不逐步保留重复历史。更新所有生产者、Estimator 输入、fixture 与测试消费者，完全删除旧 `report["profile"]` 接口；没有旧字段 alias。累计 profile 导出不推进 committed step、不执行训练。
+- JSON reply 按 WorkerIdentity 合同重新构造并核对 rank/稳定 ID/generation；step ID 按整数合同验证，拒绝 False 等与0数值相等的非整数确认。ACK、safe、profile 均核对当前期望 step。固定控制 token 和完整报告绑定 identity；所有错误沿同一 RuntimeErrorWithAudit/cleanup 路径传播。
+- 移除每次操作前与已完成 P2P/计算边界重复的 CUDA synchronize，保留实际计算/P2P/optimizer 完成同步与 Profiler events；同一个端点 stage 只生成一次 batch，PP1 同时使用其 tokens/labels，删除重复数据生成。将 backward 的副作用条件表达式改成明确 if/else。实际 1F1B 队列、参数 owner SUM、唯一按 global samples 除法和 AdamW 次序不变。
+- 新增标准库协议验证：4个实际 metadata 子进程传输大于64KiB完整原子报告、发布中断的硬超时、错误 generation 与 bool step 拒绝、正常/错误后 PID/端口/目录清理、关闭后的 profile 请求拒绝；独立手算 F0/F1/B1/B0=1+1+2+2，核对 current-step trace 的 Eq.9/11 与 global/per-pipeline Nm。metadata harness 的 backend 明确为 `metadata`，仅测试控制协议，不执行或模拟 Gloo/NCCL 训练、gradient/AdamW，不作为分布式训练验收。长帧复现另有独立5秒外层期限及 finally cleanup/PID/临时目录审计，socketpair 无 TCP port。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 修改前 Task09 相关合同/调度/Estimator/selector/oracle CPU 组合，`--junitxml=artifacts/test-results/task09-review-baseline.xml` | 0 | 347 passed |
+| `python -m pytest tests/unit/test_runtime_contracts.py -q --device cpu -k 'reenter_or_reopen or port_reservation or incomplete_control_frame' --tb=short --junitxml=artifacts/test-results/task09-review-before.xml` | 1 | 4 failed / 24 deselected；复现两种生命周期错误、port 异常被覆盖及大帧 body 阻塞 |
+| 首次修正后的 runtime contracts，随后补充完整原子协议/估计输入 | 0 | 先28 passed，最终34 passed |
+| `python -m pytest tests/unit/test_runtime_contracts.py -q --device cpu --junitxml=artifacts/test-results/task09-review-contracts.xml` | 0 | 34 passed / 0 failures / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_contracts.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task09-review-regression.xml` | 0 | 357 passed / 0 failures / 0 errors / 0 skipped；包含34项，非独立新增357项 |
+| `python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task09-review-cpu.xml` | 1 | 17 setup errors，全部缺 torch；0 failures / 0 skipped，未启动真实训练 worker |
+| `python -m compileall -q src tests`；`git diff --check`；最终代码/调用点与 JUnit/审计 JSON 核对 | 0 | 通过；已删除旧 Pipe 对象消息、累计 profile 每步字段，没有兼容路径或未声明工具 |
+
+- 报告：`artifacts/test-results/task09-review-{contracts|regression|cpu}.log/.xml`、`task09-review-before.xml`、`task09-review-baseline.xml`、`task09-review-frame-audit.json`、各唯一 `runtime-*-cpu-float64-normal.json`、`task09-review-local-summary.json`。标准库协议子进程均已清理，正常退出 code=0，注入中断按错误路径 terminate；所有记录 clean、无 leaked PID、临时目录删除、已取得的端口无监听且可重用。它们不含真实训练证据。
+- 实际环境仍为 Windows/Python3.13.12/pytest9.1.1，缺少 torch，非固定目标容器。没有安装/改变环境、访问服务器、运行 GPU 或真实训练 kill。CPU/Gloo 数值/P2P/Profiler 与4 GPU FP64/FP32/NCCL，以及去除冗余同步后的真实 trace，仍须目标环境验证；不能标 Task09 完成或“CPU已验”。
+
+固定容器验收命令继续使用上一节三个 server 命令，其中新增合同当前为34项。用户回传实际训练日志、JUnit 和 runtime JSON 后再确认验收状态。
 
 ## 每次完成小功能的记录格式
 

@@ -66,6 +66,50 @@ def cuda_nccl(world_size):
     return validate_device("cuda", world_size)
 
 
+@pytest.fixture(scope="module")
+def symmetric_training(request):
+    """Three real DP2/PP2 updates; reference tensors never enter the runtime."""
+    import torch
+    import time
+    from chameleon import ClusterState, ModelConfig, WorkerIdentity
+    from chameleon.environment import environment_report, validate_container
+    from chameleon.model import build_initial_model
+    from chameleon.reference import ReferenceTrainer
+    from chameleon.runtime import SymmetricRuntime, SymmetricTopology
+
+    device = request.config.getoption("--device")
+    if request.config.getoption("--world-size") != 4:
+        pytest.fail("Task09 DP2/PP2 acceptance requires --world-size 4")
+    if device == "cuda":
+        validate_container(environment_report())
+    config = ModelConfig(vocab_size=7, hidden_size=4, num_layers=2, num_heads=1,
+                         sequence_length=3, global_batch_size=11, micro_batch_size=2)
+    workers = tuple(WorkerIdentity(f"stable-{20 - rank}", rank, 2) for rank in reversed(range(4)))
+    topology = SymmetricTopology(ClusterState(workers, 11, generation=2), config,
+                                (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head")))
+    runtime = SymmetricRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
+    with runtime:
+        steps = []
+        for step in range(3):
+            assert runtime.state.committed_global_step == step
+            steps.append(runtime.train_step())
+            assert runtime.state.committed_global_step == step + 1
+            assert all(process.is_alive() for process in runtime.processes)
+            assert [process.pid for process in runtime.processes] == [row["pid"] for row in runtime.ready]
+            time.sleep(.1)
+            assert not any(connection.poll() for connection in runtime.connections)
+            assert runtime.state.committed_global_step == step + 1
+        profiles = runtime.snapshot_profiles()
+    assert runtime.audit["clean"]
+    assert all(worker["exitcode"] == 0 for worker in runtime.audit["workers"])
+    torch.set_num_threads(1)
+    reference = ReferenceTrainer(build_initial_model(config, device=device),
+                                 ClusterState((WorkerIdentity("reference", 0, 0),), 11),
+                                 lr=.007, weight_decay=.125)
+    return {"runtime": runtime, "steps": steps, "reference": [reference.train_step() for _ in range(3)],
+            "profiles": profiles, "config": config, "device": device}
+
+
 def pytest_terminal_summary(terminalreporter):
     for path in sorted(terminalreporter.config._chameleon_reports):
         terminalreporter.write_line(f"{path}:\n{path.read_text(encoding='utf-8')}")

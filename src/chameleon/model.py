@@ -66,3 +66,36 @@ def build_initial_model(config: ModelConfig, *, device: str = "cpu",
         torch.random.default_generator.manual_seed(config.seed)
         model = TinyTransformer(config)
     return model.to(device=device, dtype=dtype)
+
+
+class PipelineStage(nn.Module):
+    """Own only the selected initial modules, retaining global parameter names."""
+
+    def __init__(self, model: TinyTransformer, module_ids: tuple[str, ...]):
+        super().__init__()
+        self.config = model.config
+        self.module_ids = module_ids
+        for name in module_ids:
+            module = model.get_submodule(name)
+            if name.startswith("blocks."):
+                if not hasattr(self, "blocks"):
+                    self.blocks = nn.ModuleDict()
+                self.blocks[name.split(".")[1]] = module
+            else:
+                self.add_module(name, module)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden = inputs
+        mask = torch.ones(self.config.sequence_length, self.config.sequence_length,
+                          dtype=torch.bool, device=inputs.device).triu(1)
+        for name in self.module_ids:
+            module = self.get_submodule(name)
+            hidden = module(hidden, src_mask=mask) if name.startswith("blocks.") else module(hidden)
+        return hidden
+
+
+def build_initial_stage(config: ModelConfig, module_ids: tuple[str, ...], *,
+                        device: str = "cpu", dtype: torch.dtype = torch.float64) -> PipelineStage:
+    """Initial startup only; discard unowned CPU modules before moving to the device."""
+    stage = PipelineStage(build_initial_model(config), module_ids)
+    return stage.to(device=device, dtype=dtype)

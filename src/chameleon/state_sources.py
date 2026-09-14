@@ -34,8 +34,9 @@ class StateTensor:
         return self.parameter_name, self.kind
 
 
-def adamw_inventory(model, optimizer) -> tuple[StateTensor, ...]:
+def adamw_inventory(model, optimizer, *, committed_global_step: int) -> tuple[StateTensor, ...]:
     """Read complete live trainable state without copying or initializing tensors."""
+    _integer("committed_global_step", committed_global_step)
     import torch
     from .model import parameter_inventory
 
@@ -53,12 +54,11 @@ def adamw_inventory(model, optimizer) -> tuple[StateTensor, ...]:
         state = optimizer.state.get(parameter, {})
         if (set(state) != set(ADAMW_FIELDS[1:])
                 or any(not isinstance(t, torch.Tensor) for t in state.values())
-                or state["step"].numel() != 1
-                or not torch.isfinite(state["step"]).all().item()
-                or state["step"].item() < 1
-                or state["step"].item() != int(state["step"].item())
-                or any(state[k].shape != parameter.shape for k in ADAMW_FIELDS[2:])):
-            raise UnrecoverableStateError(f"incomplete AdamW state: {entry.name}")
+                or state["step"].shape not in ((), (1,))
+                or state["step"].item() != committed_global_step
+                or any(state[k].shape != parameter.shape or state[k].dtype != parameter.dtype
+                       or state[k].device != parameter.device for k in ADAMW_FIELDS[2:])):
+            raise UnrecoverableStateError(f"incomplete or stale AdamW state: {entry.name}")
         for kind, tensor in (("parameter", parameter), *state.items()):
             result.append(StateTensor(entry.name, entry.module_id, kind, tuple(tensor.shape),
                                       str(tensor.dtype), tensor.numel() * tensor.element_size()))
@@ -70,6 +70,15 @@ class WorkerInventory:
     worker: WorkerIdentity
     committed_global_step: int
     tensors: tuple[StateTensor, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.worker, WorkerIdentity):
+            raise ValueError("inventory requires a WorkerIdentity")
+        _integer("committed_global_step", self.committed_global_step, 0)
+        if (not isinstance(self.tensors, tuple)
+                or any(not isinstance(t, StateTensor) for t in self.tensors)
+                or len({t.key for t in self.tensors}) != len(self.tensors)):
+            raise ValueError("invalid or duplicate worker tensor inventory")
 
 
 @dataclass(frozen=True)
@@ -107,10 +116,6 @@ def build_state_source_map(state: ClusterState, required: tuple[StateTensor, ...
     for inventory in inventories:
         if inventory.committed_global_step != state.committed_global_step:
             raise ValueError("inventory must describe the committed global step")
-        if (not isinstance(inventory.tensors, tuple)
-                or any(not isinstance(t, StateTensor) for t in inventory.tensors)
-                or len({t.key for t in inventory.tensors}) != len(inventory.tensors)):
-            raise ValueError("invalid or duplicate worker tensor inventory")
         if any(expected.get(t.key) != t for t in inventory.tensors):
             raise ValueError("worker tensor metadata differs from required inventory")
     sources = []

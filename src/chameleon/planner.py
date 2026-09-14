@@ -5,10 +5,10 @@ and measured transition costs belong to the Restorer. Memory capacity is uniform
 across target slots. No transition estimate is fabricated here.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from itertools import accumulate, combinations, product
 
-from .contracts import ClusterState, ModelConfig, _integer
+from .contracts import ClusterState, ModelConfig, WorkerIdentity, _finite, _integer
 from .estimators import Estimator, MemoryEstimate, TimeEstimate
 from .profiler import _hash
 
@@ -113,15 +113,48 @@ def layer_layouts(module_order: tuple[str, ...], layer_modules: tuple[str, ...],
 
 @dataclass(frozen=True)
 class DynamicPlan:
-    plan_id: str
     global_batch_size: int
     generation: int
-    survivor_worker_ids: tuple[str, ...]
+    survivors: tuple[WorkerIdentity, ...]
+    profile_hash: str
     pipeline_lengths: tuple[int, ...]
     pipeline_micro_batches: tuple[int, ...]
     layouts: tuple[tuple[tuple[str, ...], ...], ...]
     time: TimeEstimate | None
     memory: tuple[MemoryEstimate, ...]
+    plan_id: str = field(init=False)
+
+    def __post_init__(self):
+        ClusterState(self.survivors, self.global_batch_size, self.generation)
+        if (not all(isinstance(values, tuple) for values in
+                    (self.pipeline_lengths, self.pipeline_micro_batches, self.layouts))
+                or any(not isinstance(layout, tuple) or any(not isinstance(stage, tuple) for stage in layout)
+                       for layout in self.layouts)):
+            raise ValueError("plan lengths, micro-batches and nested layouts must be tuples")
+        for count in self.pipeline_lengths:
+            _integer("pipeline length", count)
+        for count in self.pipeline_micro_batches:
+            _integer("pipeline micro-batch count", count)
+        if (not self.pipeline_lengths or len(self.pipeline_lengths) != len(self.pipeline_micro_batches)
+                or tuple(len(layout) for layout in self.layouts) != self.pipeline_lengths
+                or sum(self.pipeline_lengths) != len(self.survivors)):
+            raise ValueError("pipeline lengths, layouts and micro-batches must match survivors")
+        if self.time is not None:
+            if self.layouts != self.time.derivation["layouts"]:
+                raise ValueError("plan layout must match its time estimate")
+            if self.profile_hash != self.time.derivation["profile_hash"]:
+                raise ValueError("plan profile must match its time estimate")
+            if (self.pipeline_micro_batches != self.time.derivation["pipeline_micro_batches"]
+                    or sum(self.pipeline_micro_batches) != self.time.derivation["global_micro_batches"]):
+                raise ValueError("plan micro-batches must match the estimated distribution")
+            if self.time.feasible:
+                _finite("estimated step time", self.time.step_time_s, positive=True)
+        object.__setattr__(self, "plan_id", "dynamic-" + _hash({
+            "workers": tuple(asdict(w) for w in sorted(self.survivors, key=lambda w: w.worker_id)),
+            "generation": self.generation, "global_batch_size": self.global_batch_size,
+            "lengths": self.pipeline_lengths, "batch": self.pipeline_micro_batches,
+            "layouts": self.layouts, "profile_hash": self.profile_hash,
+        }))
 
     @property
     def policy(self) -> str:
@@ -141,8 +174,9 @@ class DynamicPlan:
 
 
 class NoFeasibleDynamicPlanError(RuntimeError):
-    def __init__(self, reasons: tuple[str, ...]):
+    def __init__(self, reasons: tuple[str, ...], rejected_plan: DynamicPlan | None):
         self.reasons = reasons
+        self.rejected_plan = rejected_plan
         super().__init__("; ".join(reasons))
 
 
@@ -166,11 +200,10 @@ class Planner:
         if state.global_batch_size != self.config.global_batch_size:
             raise ValueError("state must preserve the configured global batch size")
         workers = tuple(sorted(state.workers, key=lambda worker: worker.worker_id))
-        worker_ids = tuple(worker.worker_id for worker in workers)
         order = tuple(self.estimator.profile["identity"]["module_order"])
         profile_hash = _hash(self.estimator.profile)
         for dp in self.r_dp:
-            for lengths in integer_partitions(len(worker_ids), dp, self.r_pp):
+            for lengths in integer_partitions(len(workers), dp, self.r_pp):
                 batches = batch_distributions(self.global_micro_batches, lengths)
                 if not batches:
                     continue
@@ -184,19 +217,16 @@ class Planner:
                     for batch in batches:
                         time = (self.estimator.dynamic_time(layouts, batch, global_micro_batches=self.global_micro_batches)
                                 if memory_feasible else None)
-                        plan_id = "dynamic-" + _hash({"workers": tuple(asdict(worker) for worker in workers),
-                                                   "generation": state.generation,
-                                                   "global_batch_size": state.global_batch_size,
-                                                   "lengths": lengths, "batch": batch, "layouts": layouts,
-                                                   "profile_hash": profile_hash})
-                        yield DynamicPlan(plan_id, state.global_batch_size, state.generation, worker_ids,
+                        yield DynamicPlan(state.global_batch_size, state.generation, workers, profile_hash,
                                           lengths, batch, layouts, time, memory)
 
     def best_dynamic_plan(self, state: ClusterState) -> DynamicPlan:
         """Minimize estimated post-recovery step time; break exact ties by plan ID."""
-        best, reasons = None, set()
+        best, rejected, reasons = None, None, set()
         for plan in self.candidates(state):
             if not plan.feasible:
+                if rejected is None:
+                    rejected = plan
                 reasons.update(plan.reasons)
             elif best is None or (plan.estimated_step_time_s, plan.plan_id) < (best.estimated_step_time_s, best.plan_id):
                 best = plan
@@ -205,5 +235,5 @@ class Planner:
                 f"no legal dynamic plan: {len(state.workers)} survivors, Rdp={self.r_dp}, Rpp={self.r_pp}, "
                 f"{self.global_micro_batches} global micro-batches, {self.config.num_layers} layers; "
                 "pipelines require data and nonempty stages",)
-            raise NoFeasibleDynamicPlanError(details)
+            raise NoFeasibleDynamicPlanError(details, rejected)
         return best

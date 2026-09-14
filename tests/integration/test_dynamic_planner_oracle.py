@@ -196,7 +196,7 @@ def test_complete_candidate_space_and_best_time_against_oracle(survivors, layers
         assert plan.policy == "dynamic" and sum(plan.pipeline_lengths) == survivors
         assert sum(plan.pipeline_micro_batches) == nm and min(plan.pipeline_micro_batches) >= 1
         assert plan.global_batch_size == state.global_batch_size and plan.generation == state.generation
-        assert plan.survivor_worker_ids == tuple(sorted(worker.worker_id for worker in state.workers))
+        assert plan.survivors == tuple(sorted(state.workers, key=lambda worker: worker.worker_id))
         assert tuple(tuple(row["peak_bytes"] for row in memory.stages) for memory in plan.memory) == peaks
         assert plan.feasible == (time is not None)
         if time is not None:
@@ -241,7 +241,7 @@ def test_survivor_counts_and_actual_identities_are_searched_separately():
     different = replace(state, workers=(WorkerIdentity("replacement", 4, 0), *state.workers[:-1]))
     other = planner.best_dynamic_plan(different)
     assert other.plan_id != best.plan_id
-    assert "replacement" in other.survivor_worker_ids and "worker-4" not in other.survivor_worker_ids
+    assert "replacement" in {w.worker_id for w in other.survivors} and "worker-4" not in {w.worker_id for w in other.survivors}
     different_ranks = replace(state, workers=tuple(replace(worker, rank=worker.rank + 10) for worker in state.workers))
     assert planner.best_dynamic_plan(different_ranks).plan_id != best.plan_id
     assert planner.best_dynamic_plan(replace(state, workers=tuple(reversed(state.workers)))) == best

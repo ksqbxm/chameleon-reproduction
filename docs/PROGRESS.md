@@ -1,6 +1,8 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。未实现分布式训练或恢复算法，未执行真实 GPU 或训练进程 kill 测试。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。未实现分布式训练或实际状态迁移恢复，未执行真实 GPU 或训练进程 kill 测试。
+
+Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/Estimator/Restorer 组合已实现并审阅修正；本机指定 CPU 组合 108 passed，合同及 Task05–08 算法回归 746 passed。固定容器复验待执行；受影响真实 inventory/校准补测为 39 passed / 22 errors（缺 torch），真实训练中的策略切换按总计划在 Task13 验证。
 
 ## 状态
 
@@ -12,7 +14,9 @@
 | 04 | 服务器全仓回归通过；NGC 版本表示检查已修正；双 GPU 校准待重跑 | 用户回传全仓 318 passed、Task04 CUDA 115 passed / 3 setup errors（环境合同阻断）；本次合同测试 54 passed；原 CUDA 命令本机因缺 torch 配置阶段退出 |
 | 05 | 算法单测已验；真实 CPU profile 接入待验 | 审阅后 Task05 161 passed / 3 errors（缺 torch）；全仓 421 passed / 89 errors（缺 torch）；GPU runtime 闭环在 09/10 |
 | 06 | 已实现并审阅修正；本机 CPU oracle 已验；固定容器待复验 | 审阅后指定四文件 288 passed；调度/Estimator 回归 161 passed；无失败或跳过；本 task 不要求独立 GPU 测试 |
-| 07-15 | 待实施 | 未执行 |
+| 07 | 已审阅并修正 plan/estimate/ACK 绑定与 transition 计费；指定 CPU oracle 已验；固定容器与真实路径待验 | 指定四文件 135 passed；Task05/06/07 算法组合 584 passed；真实 inventory/校准/profile 回归 101 passed / 41 errors（缺 torch）；实际通信在 10/12 |
+| 08 | 已实现并审阅修正；本机 CPU 算法组合已验；固定容器与真实路径待验 | 指定两文件 108 passed；合同及 Task05–08 算法回归 746 passed；真实 inventory/校准补测 39 passed / 22 errors（缺 torch）；真实策略切换在 13 |
+| 09-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -413,6 +417,159 @@ python -m pytest tests/unit/test_integer_partitions.py tests/unit/test_batch_dis
 
 - 已核对最终 JUnit 288/161 tests，全部无 failures/errors/skips；上述 XML 有同 basename 的真实日志，位于 `artifacts/test-results/`。汇总为 `task06-review-local-summary.json`，审阅差异为 `task06-review.diff`；修改前快照只位于忽略的 artifacts 供差异审阅，不是可执行兼容路径。
 - 本机仍为 Windows / Python 3.13.12 / pytest 9.1.1、无 torch，device=cpu；没有启动 backend、worker、GPU、kill 或产生 PID/端口/rendezvous 资源，没有安装或改变环境、访问服务器。当前统一 memory capacity 和 Eq.14/computation-only 估计边界保持不变。固定容器复验及前置 Task04/05 的待验项仍未执行，不宣称真实训练/迁移验收通过；服务器沿用上节 Task06 CPU 命令执行当前实现。
+
+## Task 07 实现与开发验证（2026-09-13）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task07、后续 selector/recovery 文档和现有 Planner/Estimator/Profiler/校准实现；适用父目录与仓库未发现额外 AGENTS.md，遵循用户提供的全局规则。保留开始时已有的 Task06 文件和进度变更，不修改后续任务或安装依赖。
+- 算法依据核对为论文 [Restorer 与 Figure 3](https://arxiv.org/html/2508.21613v4#S4.SS2)。图中 DP2 到 DP2′ 的 layer-count matrix 用作独立 Hungarian 测试；实际规划按缺失 tensor 字节计费，包含 optimizer state。
+- 实现/测试范围：`src/chameleon/state_sources.py`、`hungarian.py`、`coloring.py`、`restorer.py`；Task07 指定四份测试，以及补充 `tests/integration/test_restorer_inventory.py`；必要地修改 `src/chameleon/transfer_calibration.py` 和对应校准测试，更新本文件。没有修改 Planner、Estimator、模型训练路径、依赖或环境合同。
+- 完整 inventory：worker 侧 `adamw_inventory` 只读当前全部 trainable parameter 和已 materialize 的 step/exp_avg/exp_avg_sq 元数据，不复制 tensor 值、不调用初始化、不读取 reference。包括 embedding、blocks、final norm、head、新增模块，排除冻结参数；缺 optimizer tensor、错误 optimizer ownership/AMSGrad/shape/step 被拒绝。
+- `build_state_source_map` 对照完整必需 inventory 检查当前 survivor identity、rank/generation、committed step、tensor 名称/shape/dtype/bytes；每个模型单元必须至少有一个完整健康 parameter/AdamW 副本。任何必需 tensor 无来源即 `UnrecoverableStateError`，不拼接不同残缺副本。controller 仅保存元数据，不保存恢复用训练状态。
+- Hungarian 使用整数字节与确定性下标顺序，输出 survivor-to-slot 一对一最小成本匹配。独立 permutation oracle 对照 150 个固定 seed 小矩阵，另覆盖 Figure3、零成本同分和超过浮点精度的字节成本；不引入新依赖。
+- Restorer 真正接入 Planner/Estimator 输出，检查布局、survivors、generation、B、profile identity 和完整模型字节清单。manifest 每个目标 tensor 恰有一个本地保留或健康迁移来源；migration bytes 与匹配成本相等。完整旧状态列在 held_sources，release_after_ack 只列目标不再需要的旧状态，ACK 全部到齐之前禁止取得释放许可。此处是规划/许可检查，不宣称已在 worker 中实现状态保留、P2P 或 topology commit。
+- 通信图覆盖 blocks 和全部端点/新增模型单元，同 worker device 的单元相邻。DSATUR 按 saturation、degree、stable ID 选点并取最小可用颜色，输出确定性 synchronization rounds；不宣称一般图最优色数。migration rounds 另按 source/destination device 冲突着色，供 transition 估计使用。
+- transition 使用调用方实测且未与训练重叠的搜索时长、每轮最慢传输校准时间之和、实测 bootstrap，分别记录各成本。对应 tensor 大小缺校准就拒绝估计，包括 0 migration 时仍要求 bootstrap 校准；不使用任意带宽/时间常量或 D。当前采用同质两 rank 校准的明确 proxy：更慢方向和 endpoint mean；目标规模 bootstrap、真实物理边带宽、ACK 及 module/optimizer 容器重建额外成本仍须 runtime 实测，不宣称完整实测 transition。
+- 接入时发现原 P2P 校准仅允许 FP64 整倍数字节，不能覆盖标准 AdamW 的 4 字节 step。唯一校准执行路径改为 uint8 原始字节 buffer，允许精确正整数 tensor 字节；对应非法输入改测 0 bytes，新增 4 bytes schema/lookup oracle，真实双 rank 测试改为传输 4/64/4096 bytes。保留原硬超时/finally/PID/端口/rendezvous 审计；无旧执行路径或 adapter。
+- 测试环境为 Windows / Python 3.13.12 / pytest 9.1.1，无 torch，device=cpu；未安装或改变环境、访问服务器、运行 GPU/kill。Task07 指定算法组合全部通过，但本机结果不替代固定 Ubuntu/Python3.12.3/pytest8.1.1 容器复验。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `python -m pytest tests/unit/test_state_sources.py -q --device cpu` | 0 | 初版 42 passed |
+| `python -m pytest tests/unit/test_hungarian.py -q --device cpu` | 0 | 24 passed |
+| `python -m pytest tests/unit/test_coloring.py -q --device cpu` | 0 | 16 passed |
+| 初版 Restorer/source 组合 | 1 | 58 passed / 2 failed；测试误用不存在的 Planner 属性，且原 fixture 没有产生可释放旧状态；修正断言和明确包含待释放状态的旧布局 |
+| 修正后的 Restorer/source 组合 | 0 | 60 passed |
+| 校准非 torch 最窄测试 | 0 | 39 passed / 3 deselected；仅 deselect 真实通信/清理测试，随后实际运行完整文件记录其环境错误 |
+| `python -m pytest tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task07-cpu.xml` | 0 | 113 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task07-live-cpu.xml` | 1 | 39 passed / 20 errors / 0 failed / 0 skipped；17 项真实 inventory、3 项真实校准/清理均因缺 torch 在 setup 阶段退出 |
+| `python -m pytest tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task07-regression.xml` | 1 | 511 passed / 16 errors / 0 failed / 0 skipped；16 项真实 profiling 因缺 torch 在 setup 阶段退出 |
+| `python -m compileall -q src tests`；`git diff --check` | 0 | 通过 |
+
+- 报告与完整日志：`artifacts/test-results/task07-cpu.xml/.log`、`task07-live-cpu.xml/.log`、`task07-regression.xml/.log`。JUnit 已逐项核对，错误均为 `No module named 'torch'`，没有算法 assertion failure 或 skip。
+- 本次真实通信 fixture 在 import 阶段失败，没有 worker、backend、PID/端口/rendezvous 资源，不能宣称已验证字节传输或资源清理。Task07 本身没有独立 GPU 必测；实际同步与迁移继续在 Task10/12。由于修改了 Task04 校准执行路径，其双 GPU 校准同样须在既有服务器合同下复验。
+- 最终检查当前相关 diff 及新增文件，保留既有工作，无额外进度文件、未声明依赖、checkpoint/reference 恢复输入、初始化恢复、mock 传输、skip/CPU fallback。下一项为 Task08 的 Equation8 selector，尚未实现。
+
+固定容器从项目工作目录执行，使用既有 python，无需安装依赖：
+
+```bash
+python -m pytest tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py -q --device cpu --junitxml=artifacts/test-results/task07-server-cpu.xml
+python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task07-server-live-cpu.xml
+python -m pytest tests/distributed/test_transfer_calibration.py -q --device cuda --world-size 2 --require-gpu --junitxml=artifacts/test-results/task07-server-calibration-gpu.xml
+```
+
+最后一条用于受本次改动影响的 Task04 双 GPU 字节校准；不是 Task07 实际恢复/GPU runtime 已通过的证据。服务器验收未执行，完整回传日志/报告后才能确认这些待验项。
+
+## Task 07 审阅与优化（2026-09-14）
+
+- 按用户要求审阅正确性、完备性和简洁性，对照 `CLAUDE.md`、总计划、Task07 以及现有合同和测试。修改仅涉及 Restorer、state inventory、冲突图、必要的 Planner/Estimator 接口、校准聚合、对应测试和本文件；保留之前未提交工作，不修改依赖、环境或后续任务。
+- plan 绑定问题：原 Restorer 只比较 survivor ID 和 profile identity，能接受 rank 已变化的旧 plan、identity 相同但内容变化的 profile，以及被改为 0/负数/不守恒或与时间估计不一致的 micro-batch 分配。新增 7 项测试先复现这些错误。现 DynamicPlan 保存完整 WorkerIdentity 与完整 profile hash，构造时检查 pipeline/partition geometry 和对应时间估计，Restorer 精确比较当前 survivors 与 profile 内容。
+- 内部一致性问题：合法 layout 改动仍能搭配旧时间估计，可变嵌套 list 也能在生成 ID 后改变内容。现 Estimator 导出该估计对应的完整 layouts/profile hash，复制输入布局和 micro-batch 分配为 tuple；DynamicPlan 只接受不可变身份输入并核对 estimate 来源。新增测试覆盖改变合法 layout、替换 estimate profile、可变输入和输入修改后快照不漂移。plan ID 只在 DynamicPlan 构造时从当前完整内容生成，删除 Planner 的旧独立 ID 生成及裸 survivor ID 字段，不提供兼容入口。
+- ACK 问题：原 ACK 只匹配 tensor/worker/slot，下一 committed step 的相同迁移会接受旧 ACK。现 manifest ID 绑定 plan、committed step 和实际 actions；ACK 必须携带该 ID，不匹配则不改变 pending 集合。更新全部调用点，删除未绑定 manifest 的 ACK 签名；保持全部 target ACK 前不能释放旧状态的规则。
+- transition 问题：原 bootstrap 被标为共有成本，但混入 dynamic 的策略 transition，后续直接与 rerouting 的 paper-model 0 比较会产生不一致计费。现 `estimated_transition_time_s = unoverlapped_search_time_s + migration_time_s`，只表示 Equation8 的策略成本；`common_control_time_s` 单列实测 bootstrap，`estimated_total_time_s` 从两者求和。共有成本必须对两策略一致计入，删除旧混合 total 和 rebuild 字段；零迁移测试分别验证策略成本 0 与总成本中的实测 bootstrap。
+- 实际 inventory 问题：原函数只检查 parameter step 为正，无法识别其他已提交 step 的陈旧状态；moments 也只比较 shape。现强制传入 committed step，并逐参数核对实际 AdamW step 相等及 moment shape/dtype/device 一致；移除旧“任意正 step”逻辑和多次标量读取。新增 stale positive step/dtype 的真实 PyTorch 测试及非法 committed step 的纯 CPU 合同测试。
+- 冲突图问题：单个字符串 device ID 会被迭代为字符，导致不同 device 被错误连边。先运行新增测试复现，再要求 device owners 为 tuple，明确拒绝该输入；不自动猜测或修补设备信息。
+- 简洁性：校准原先对每个 tensor、每个方向反复解析/校验全部样本。现唯一 `calibration_times_s` 路径一次聚合全部 endpoint means 和 bootstrap，现有 transfer/bootstrap 查询共同使用它；Restorer 在接入完整校验过的 profile 快照时保存各 size 的时间，重复估计不再解析样本。按 size 使用最新匹配的校准样本，保持较慢方向的原估计含义，不增加带宽插值或默认值。重复估计测试核对结果一致且没有重新校验 calibration。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| 修改前指定四文件组合，`--junitxml=artifacts/test-results/task07-review-baseline.xml` | 0 | 113 passed |
+| `python -m pytest tests/integration/test_plan_restorer.py -q --device cpu -k 'changed_batch_distribution or binds_full_worker or binds_entire_profile or ack_is_bound or shared_bootstrap or does_not_reparse' --tb=short --junitxml=artifacts/test-results/task07-review-before.xml` | 1 | 10 failed / 26 deselected；修正前复现 |
+| 修正上述问题后的同一最窄筛选 | 0 | 10 passed / 26 deselected |
+| 来源/Planner/Estimator/Restorer 最窄组合 | 0 | 242 passed |
+| `python -m pytest tests/distributed/test_transfer_calibration.py -q --device cpu -k 'not two_real and not hard_timeout and not worker_exception' --tb=short` | 0 | 39 passed / 3 deselected；完整文件随后在真实路径组合中实际运行 |
+| 新增字符串 device ID 测试、修改输入分配后 estimate 漂移测试，分别在修正前运行 | 1 | 各 1 failed；修正前复现 |
+| `python -m pytest tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task07-review-cpu.xml` | 0 | 135 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task07-review-algorithms.xml` | 0 | 584 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/integration/test_profile_estimator.py -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task07-review-live-regression.xml` | 1 | 101 passed / 41 errors / 0 failed / 0 skipped；19 项 inventory、3 项真实校准/清理、19 项真实 profile/Estimator 测试均因缺 torch 在 setup 阶段退出 |
+| `python -m compileall -q src tests`；AST/空白审阅；`git diff --check` | 0 | 通过 |
+
+- 已逐项核对 JUnit 135/584 tests 全部无 failures/errors/skips；真实路径的 41 errors 全部为 `No module named 'torch'`。上述 XML 具有同 basename 的完整日志；补充来源/可变输入复现报告为 `task07-review-provenance-before.xml`，汇总为 `artifacts/test-results/task07-review-local-summary.json`。
+- 本机仍为 Windows / Python3.13.12 / pytest9.1.1、无 torch，device=cpu；没有 backend、worker、GPU 或 kill 启动，因此不能声称完成 PID/端口/rendezvous 清理或实际状态恢复验证。没有安装或修改环境、访问服务器。两 rank 校准的 proxy 边界仍保持，目标规模 bootstrap、真实边带宽、ACK 和 module/optimizer 容器重建耗时仍须 runtime 实测。
+- 最终检查代码 diff 和新增文件，确认旧裸 worker ID 字段、未绑定 ACK 签名、旧混合 transition 字段、重复校准聚合路径均已移除，相关 producer/consumer/tests 一并更新；无 legacy adapter、初始化恢复或额外进度文件。前置 task 的服务器待验项保持原状。
+
+固定容器从项目工作目录使用既有 python 执行当前算法与真实路径复验：
+
+```bash
+python -m pytest tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py -q --device cpu --junitxml=artifacts/test-results/task07-review-server-algorithms.xml
+python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py tests/unit/test_profiler.py tests/integration/test_profile_roundtrip.py tests/integration/test_profile_estimator.py -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task07-review-server-live-cpu.xml
+```
+
+受 Task07 原字节校准变更影响的双 GPU 校准仍沿用上一节命令；本次未执行服务器或 GPU 验收。
+
+## Task 08 实现与开发验证（2026-09-14）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task07/08 文档和已有 Planner、Estimator、Restorer、state sources、数据合同及测试；未发现额外仓库 AGENTS.md。保留工作区已有 Task07 未提交修改。本次仅新增 `src/chameleon/decision_center.py`、`tests/unit/test_policy_selector.py`、`tests/integration/test_decision_center_oracle.py`，更新本文件；没有修改依赖、环境或后续 task。
+- `RecoveryState` 保存故障前 ClusterState、FailureEvent、原 stage 布局和完整 worker 映射，以及 survivor-only 的 parameter/AdamW 元数据。检查故障 generation、committed step、完整 worker identity、topology 覆盖和 survivor inventory；不保存训练 tensor、模型 reference 或初始化备份。评估/选择不推进 committed step、不重建 generation、不释放源状态。
+- rerouting 独立保留原 layer layout 和逻辑 pipeline，健康任务仍由原 worker 执行；失败 stage 的 micro-batch 任务按稳定 worker ID 轮转给同 stage 的健康 DP peers，多故障的额外任务合并均匀分配。路线包含每个逻辑 pipeline/stage/micro-batch 的唯一 owner，forward/backward 使用同一 owner。每个 owner 必须保有该 stage 的完整 parameter/step/exp_avg/exp_avg_sq 状态。
+- 使用现有 Eq.12/13，明确 global Nm 与每 pipeline Nm；使用包含 endpoints 的实测 module EMA，将最大 stage forward/backward 时间输入 uniform-stage 近似，并在候选推导中报告该边界。该 rerouting 输入表示原对称 DP/PP 布局；原 Nm 无法等分时明确标为该估计域内不可行，dynamic 仍独立评估；不为不等 partitions 伪造 Eq.12/13。Fi>=Ndp 先判不可行，避免零分母；若 survivor 额外持有旧完整单元，dynamic 仍可从 survivor memory 恢复。
+- 两类候选均输出 Eq.14 内存；rerouting 静态 parameter/AdamW 只计一次，live activation 按该 worker 服务的逻辑 pipeline 数保守计入，并记录 streams、static bytes、每 stream activation bytes 和 peak。这是逻辑 tensor/平均层近似，不能声称真实 HBM 测量。无 feasible dynamic 时保留第一个被拒绝布局的数值内存诊断及 Algorithm1 全部拒绝原因，不把它称为最优 plan。
+- `evaluate_candidates(state, profile)` 不接收 D、不计算 score、不选 policy。它真实调用 Algorithm1 的 `Planner.best_dynamic_plan`，仅最小化 post-recovery step time；再调用 Restorer 的 Hungarian/DSATUR manifest 和实测 transition 估计。未重叠搜索用实际 `perf_counter` 包围 Planner search；迁移仅使用精确 tensor size 的校准。缺 bootstrap/P2P 校准时 dynamic 明确不可行、transition 为 None，不填默认秒数；rerouting 的 paper-model 策略 transition 为 0，实测共有 bootstrap 对双方单列，未测时为 None。
+- `select(state, profile, inter_fault_duration_s)` 先校验调用方提供的有限正 D，再严格执行 `(B/t_step)*((D-t_transition)/D)`；D<=transition 的候选没有 score。最终选最大 score，完全同分按更小 transition、再按稳定 plan ID；拒绝混合 B/generation、重复 policy/plan ID、非法或缺失估计与计算后非有限 score。缺失 D 不执行 search、不生成 DecisionResult；没有可用候选抛出带完整推导的 `NoUsablePolicyError`，没有 survivor 则抛出 `UnrecoverableStateError`。
+- `PolicyDecision` 继承原 DecisionResult，携带选中的完整 rerouting routes 或 MigrationManifest，以及可 JSON 序列化的双方候选、D/B、time/transition/memory、Equation8 factors/score、唯一选中项和淘汰原因。故障 ID 集合及 survivor/inventory 顺序不改变稳定候选身份；不添加默认 policy、MTBF 预测或 min(step) 选择路径。实际 recover、P2P 和 topology commit 仍按 Task12 实现，本 task 不提供假恢复入口。
+- 单测手算 B=10、rerouting(step=2,transition=0)、dynamic(step=1,transition=10)：D=15 选 rerouting、D=40 选 dynamic、D=20 同分选较小 transition。组合测试使用受控 profiling/calibration/search clock，真实执行 Planner、Estimator、Restorer；独立穷举 dynamic space、Hungarian bytes、校准 endpoint/iteration means 和窗口 useful samples oracle，不调用生产 scorer。同一 profile 下 best dynamic 与 D 无关，最终 policy 随 D 改变。覆盖单候选、两侧独立 OOM、完整副本丢失、端点及新增 trainable 单元、peer 无状态、Fi>=Ndp、无 survivor、D<=transition、缺失/非法 D、缺校准、陈旧 inventory 和 topology/profile 不匹配。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| 修改前 Task07 指定四文件 CPU 组合 | 0 | 135 passed；确认已有工作基线 |
+| `python -m pytest tests/unit/test_policy_selector.py -q --device cpu` | 0 | 初版 40 passed；后补重复 plan ID 测试，最终单测 41 项包含在指定组合中 |
+| 首次 `python -m pytest tests/integration/test_decision_center_oracle.py -q --device cpu --tb=short` | 1 | 35 passed / 1 failed；独立测试 oracle 漏算 calibration iteration mean 的 .5，修正 oracle 后 36 passed，生产估计未改 |
+| 补充 OOM/no-peer/no-survivor 最窄筛选 | 1 / 0 | 初次 3 passed / 1 failed：fixture 故障落在较小内存 stage，无法触发预期 OOM；改为输出 stage 故障后 4 passed / 36 deselected |
+| `python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-cpu.xml` | 0 | 81 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_contracts.py tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-algorithm-regression.xml` | 0 | 719 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m compileall -q src tests`；最终源码/测试/路径审阅；`git diff --check` | 0 | 通过；未使用 Ruff 或安装第三方工具 |
+| 标准库解析 JUnit 与生成本机汇总 | 1 / 0 | 初次报告字典键使用 Windows 分隔符，与相对 POSIX 键不一致而 KeyError；统一相对 `Path.as_posix()` 后核对通过并保存汇总，不影响 pytest 结果 |
+
+- 实际环境：Windows、Python3.13.12、pytest9.1.1、device=cpu。本机 torch 不存在；此次纯算法组合不依赖 torch，没有启动 backend、worker、GPU、kill、端口或 rendezvous，因此 PID/通信清理不适用。这不替代总计划的 Python3.12.3 / pytest8.1.1 固定容器验收。
+- 日志和 JUnit：`artifacts/test-results/task08-cpu.log/.xml`、`task08-algorithm-regression.log/.xml`；早期 36 项组合报告为 `task08-integration.log/.xml`。使用标准库解析最终 XML，核对 81/719 项均无 failures/errors/skips；汇总为 `artifacts/test-results/task08-local-summary.json`。
+- 最终 diff 检查保留已有 Task07 修改，Task08 只涉及上述三个新增文件与本进度记录；没有绝对文件路径、未声明 import、初始化恢复、skip、mock NCCL 或环境安装操作。
+- 未验证项：固定容器 Task08 复验；真实 runtime 的搜索重叠、迁移/ACK/容器重建与目标规模 group bootstrap；真实训练 adaptive switch 在 Task13 验证。本 task 不要求独立 GPU 验收，不能据此宣称后续 GPU/kill 路径通过；Task01–07 的既有服务器待验项保持原状。
+
+固定容器从项目工作目录使用既有 python 复验：
+
+```bash
+python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-server-cpu.xml
+```
+
+## Task 08 审阅与优化（2026-09-14）
+
+- 对照 `CLAUDE.md`、总计划、Task08 和已有合同，按用户要求审阅正确性、完备性及简洁性。保留已有 Task07 未提交工作；本次只修改 Decision Center、必需的 Planner/Restorer 接口、对应 selector/oracle 测试及本文件。没有改动环境、依赖、其他算法或后续任务。
+- 身份与数值错配：原候选可单独改写 plan ID、B、generation、step time、memory，仍带着另一份执行明细进入选择；原 PolicyDecision 也能改写 candidate 或正 score 而通过合同。先新增测试复现，现候选绑定实际 ReroutingPlan/DynamicPlan/MigrationManifest 的身份、时间和内存；PolicyDecision 核对候选对应的 ExecutionPlan 及精确 Equation8 score。ReroutingPlan ID 在构造时由 recovery identity、profile hash 和实际 routes 生成，删除 Center 的独立有效 rerouting ID 生成路径。
+- transition 来源错配：同一个 Algorithm1 plan ID 下，survivor 保有的旧 tensor 不同会产生不同 manifest 和迁移成本。新增测试证明旧代码允许混用两份 transition，导致错误 score；另测 dynamic transition 被用于 rerouting。现 PolicyCandidate 保留不可变完整 TransitionEstimate，秒数从该对象派生；Restorer 返回的 estimate 必须携带具体 manifest ID，候选核对它与执行 manifest 一致。真实 rerouting plan 的策略 transition 必须为 0、没有迁移 manifest。共有 bootstrap 与 transition 内的 common control 必须相同。
+- 原状态表示不完整：旧 RecoveryState 只接受共享 stage layout，并从 global Nm 默认为各 pipeline 等分，无法表示 Planner 已支持的非对称 topology 或原不等 batch 分配。删除 `stage_modules` 输入，唯一接口改为每 pipeline 的 `layouts`、`pipeline_workers` 和显式 `pipeline_micro_batches`；校验原 geometry、完整 worker identity、每 pipeline 完整 model order、正 partitions 和 global Nm 守恒。非对称状态可继续独立搜索 dynamic；Eq.12/13 不适用于原 layouts/partitions 不同的情况时，rerouting 明确缺少适用估计并不可行，不伪造时间或重新解释数据分配。该估计域边界仍保留，未新增未经验证的非对称 rerouting 时间模型。
+- OOM 与诊断路径：旧候选只把显式 reasons 视为估计缺失理由，导致已知 memory OOM 但没有时间测量的候选构造报错；决策又重复合并 memory reasons。现构造时统一合并去重 reasons，feasible 和决策淘汰原因使用同一来源。Planner 的 NoFeasibleDynamicPlanError 直接携带本轮已评估的首个 rejected plan；删除 Center 的第二次 `planner.candidates()` 枚举，保留原数值内存诊断且不将 rejected plan 当 best plan。
+- 缓存与错误传播：Center 原先再次解析 calibration 计算 common bootstrap；现从 Restorer 已聚合的只读属性取值，删除 Center 的 calibration 聚合 import/调用。原广泛捕获 `ValueError` 会掩盖内部 invariant 错误并偏向 rerouting；现只有 `MissingTransitionCalibrationError` 被记录为缺数据，其余异常直接传播。TransitionEstimate 统一验证 search/migration/common 数值和总和；共有成本未测时 total 明确为 None，策略秒数仍可为 paper-model 0；删除 Restorer 重复的旧 total 局部计算/校验。
+- 路由构造时一次累积每 owner 服务的逻辑 pipeline 集合，删除内存估计中逐 worker 全量重扫 routes。仍保留完整 parameter/AdamW sources、所有 endpoints/新增 trainable units、同 stage 均匀 task routing 和一次静态状态加多 stream activation 的内存估计。评估不接收 D，Algorithm1 目标不变，最终 Equation8/tie-break 不变；没有新增默认 policy、兜底恢复、初始化或兼容入口。
+
+实际命令与结果：
+
+| 阶段 / 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| 修改前指定两文件 CPU 组合，`--junitxml=artifacts/test-results/task08-review-baseline.xml` | 0 | 81 passed |
+| 指定两文件最窄筛选 `-k 'decision_is_bound or memory_infeasibility_is_a_complete or candidate_metrics_and_identity or diagnostics_do_not_restart or asymmetric_original_topology' --tb=short --junitxml=artifacts/test-results/task08-review-before.xml` | 1 | 13 failed / 81 deselected；修正前复现 |
+| Planner/Restorer 修改后最窄原有组合：`python -m pytest tests/integration/test_plan_restorer.py tests/integration/test_dynamic_planner_oracle.py -q --device cpu --tb=short` | 0 | 76 passed |
+| 对应 Center/输入/测试更新后的指定两文件组合 | 0 | 94 passed；上述 13 项复现均已修正 |
+| manifest transition 与跨 policy transition 的独立复现，各自单项筛选 | 1 / 0 | 两项各在修正前 1 failed，修正后各 1 passed；分别保存 before XML |
+| `python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-review-cpu.xml` | 0 | 最终 108 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/unit/test_contracts.py tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-review-algorithms.xml` | 0 | 最终 746 passed / 0 failed / 0 errors / 0 skipped |
+| `python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --tb=short --junitxml=artifacts/test-results/task08-review-live-cpu.xml` | 1 | 39 passed / 22 errors / 0 failed / 0 skipped；19 项真实 inventory、3 项真实通信/清理均因缺 torch 在 setup 阶段退出 |
+| `python -m compileall -q src tests`；源码/调用点/空白审阅；`git diff --check`；标准库解析 JUnit | 0 | 通过；108/746 报告均无 failures/errors/skips；22 项 setup errors 均为 No module named 'torch' |
+
+- 日志/报告：`artifacts/test-results/task08-review-cpu.log/.xml`、`task08-review-algorithms.log/.xml`、`task08-review-live-cpu.log/.xml`；复现 XML 为 `task08-review-before.xml`、`task08-review-transition-before.xml`、`task08-review-rerouting-transition-before.xml`。环境及报告汇总为 `artifacts/test-results/task08-review-local-summary.json`。
+- 本机仍为 Windows / Python3.13.12 / pytest9.1.1、缺少 torch，device=cpu。没有创建 backend、worker、GPU、kill、端口或 rendezvous，实际 PID/通信清理尚未验证；不以受控 profiling/timing metadata 或本机通过代替固定容器或真实训练恢复。没有安装/修改环境或访问服务器。
+- 最终审阅确认旧 RecoveryState 共享布局签名、独立 transition 标量字段、重复 reason 合并、二次 Planner search、重复 common calibration 聚合、捕获全部 ValueError 的降级分支及旧 total 计算已移除；全部现有 producer/consumer/tests 使用新接口，没有 legacy adapter。Task01–07 既有服务器待验项不变，真实 adaptive switch 仍在 Task13。
+
+固定容器从项目工作目录使用既有 python 复验：
+
+```bash
+python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py tests/integration/test_plan_restorer.py tests/integration/test_dynamic_planner_oracle.py -q --device cpu --junitxml=artifacts/test-results/task08-review-server-cpu.xml
+python -m pytest tests/integration/test_restorer_inventory.py tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2 --junitxml=artifacts/test-results/task08-review-server-live-cpu.xml
+```
 
 ## 每次完成小功能的记录格式
 

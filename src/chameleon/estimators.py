@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from .contracts import _finite, _integer
-from .profiler import validate_snapshot
+from .profiler import _hash, validate_snapshot
 from .schedule import OperationKey, build_1f1b_schedule
 
 
@@ -217,6 +217,8 @@ class Estimator:
         _integer("global_micro_batches", global_micro_batches)
         if not layouts or len(layouts) != len(pipeline_micro_batches):
             raise ValueError("layouts and micro-batch partitions must cover the same pipelines")
+        layouts = tuple(tuple(tuple(stage) for stage in layout) for layout in layouts)
+        pipeline_micro_batches = tuple(pipeline_micro_batches)
         for count in pipeline_micro_batches:
             _integer("pipeline micro-batches", count)
         if sum(pipeline_micro_batches) != global_micro_batches:
@@ -228,6 +230,8 @@ class Estimator:
         return TimeEstimate(max(e.step_time_s for e in estimates), {
             "equation": 10, "pipeline_equation": 11, "global_micro_batches": global_micro_batches,
             "pipeline_micro_batches": pipeline_micro_batches,
+            "layouts": layouts,
+            "profile_hash": _hash(self.profile),
             "pipeline_times_s": tuple(e.step_time_s for e in estimates),
             "pipelines": tuple(e.derivation for e in estimates),
             "profile_identity": deepcopy(self.profile["identity"]),

@@ -7,7 +7,7 @@ def conflict_graph(unit_devices: dict[str, tuple[str, ...]]) -> dict[str, frozen
     """Include endpoints; a device may participate in only one unit per round."""
     devices = {}
     for unit, owners in unit_devices.items():
-        if (not isinstance(unit, str) or not unit.strip() or not owners
+        if (not isinstance(unit, str) or not unit.strip() or not isinstance(owners, tuple) or not owners
                 or any(not isinstance(owner, str) or not owner.strip() for owner in owners)
                 or len(set(owners)) != len(owners)):
             raise ValueError("units require nonempty unique device IDs")

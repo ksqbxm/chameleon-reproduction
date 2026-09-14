@@ -85,7 +85,7 @@ def test_reject_incomplete_or_invalid_calibrations(schema_calibration, path, val
 
 @pytest.mark.parametrize("overrides", [
     {"world_size": 1}, {"world_size": 3}, {"world_size": True},
-    {"tensor_bytes": ()}, {"tensor_bytes": (64, 64)}, {"tensor_bytes": (7,)},
+    {"tensor_bytes": ()}, {"tensor_bytes": (64, 64)}, {"tensor_bytes": (0,)},
     {"tensor_bytes": (True,)}, {"warmup": -1}, {"iterations": 0},
     {"tensor_bytes": ([64],)},
     {"bootstrap_rounds": 0}, {"timeout_s": 0}, {"timeout_s": float("inf")},
@@ -93,6 +93,16 @@ def test_reject_incomplete_or_invalid_calibrations(schema_calibration, path, val
 def test_invalid_calibration_inputs_fail_before_spawn(overrides):
     with pytest.raises(ValueError):
         run_transfer_calibration("cpu", **overrides)
+
+
+def test_calibration_accepts_four_byte_adamw_step(schema_calibration):
+    report = deepcopy(schema_calibration)
+    report["tensor_bytes"] = [4]
+    for record in report["records"]:
+        for row in record["transfers"]:
+            row["tensor_bytes"] = 4
+    validate_calibration(report)
+    assert transfer_time_s(report, 0, 1, 4) == 3.
 
 
 def test_two_real_ranks_transfer_tensors_and_roundtrip_profile(distributed_environment, device,
@@ -103,7 +113,7 @@ def test_two_real_ranks_transfer_tensors_and_roundtrip_profile(distributed_envir
     from chameleon.profiler import Profiler, export_profile, load_profile, train_profile_step
 
     assert world_size == 2, "this contract requires two real workers"
-    report = run_transfer_calibration(device, world_size)
+    report = run_transfer_calibration(device, world_size, tensor_bytes=(4, 64, 4096))
     request.config._chameleon_reports.add(Path(f"artifacts/test-results/transfer-calibration-{device}.json"))
     assert report["audit"]["clean"]
     assert len({record["pid"] for record in report["records"]}) == 2

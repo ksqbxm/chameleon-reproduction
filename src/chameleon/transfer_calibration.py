@@ -25,8 +25,6 @@ def _validate_sizes(sizes):
         raise ValueError("tensor_bytes must be a nonempty sequence")
     for size in sizes:
         _integer("tensor_bytes", size)
-        if size % 8:
-            raise ValueError("tensor_bytes must describe whole FP64 elements")
     if len(set(sizes)) != len(sizes):
         raise ValueError("tensor_bytes must be unique")
 
@@ -59,7 +57,7 @@ def _calibration_worker(rank, device, backend, port, directory, sizes, warmup,
                 torch.cuda.synchronize(target)
             record["group_bootstrap_s"].append(time.monotonic() - start)
         for size in sizes:
-            value = torch.empty(size // 8, dtype=torch.float64, device=target)
+            value = torch.empty(size, dtype=torch.uint8, device=target)
             for source, destination in ((0, 1), (1, 0)):
                 for iteration in range(warmup + iterations):
                     value.fill_(source + 1 if rank == source else 0)
@@ -278,18 +276,31 @@ def validate_calibration(report: dict) -> None:
         raise ValueError("calibration ranks must share the execution environment")
 
 
+def calibration_times_s(report: dict) -> tuple[dict[tuple[int, int, int], float], float]:
+    """Validate once and aggregate endpoint means for every measured size/direction."""
+    validate_calibration(report)
+    endpoints = []
+    for record in report["records"]:
+        totals = {}
+        for row in record["transfers"]:
+            key = row["source"], row["destination"], row["tensor_bytes"]
+            totals[key] = totals.get(key, 0.) + row["execution_time_s"]
+        endpoints.append({key: total / report["iterations"] for key, total in totals.items()})
+    transfers = {key: max(endpoint[key] for endpoint in endpoints) for key in endpoints[0]}
+    bootstrap = max(sum(r["group_bootstrap_s"]) / report["bootstrap_rounds"] for r in report["records"])
+    return transfers, bootstrap
+
+
 def transfer_time_s(report: dict, source: int, destination: int, tensor_bytes: int) -> float:
     """Use the slower measured endpoint mean; uncalibrated sizes require new measurements."""
-    validate_calibration(report)
     for name, value in (("source", source), ("destination", destination), ("tensor_bytes", tensor_bytes)):
         _integer(name, value, 1 if name == "tensor_bytes" else 0)
-    if (source, destination) not in ((0, 1), (1, 0)) or tensor_bytes not in report["tensor_bytes"]:
+    transfers, _ = calibration_times_s(report)
+    if (source, destination, tensor_bytes) not in transfers:
         raise ValueError("missing P2P calibration for this edge/tensor size")
-    return max(sum(row["execution_time_s"] for row in record["transfers"]
-                   if (row["source"], row["destination"], row["tensor_bytes"]) == (source, destination, tensor_bytes))
-               / report["iterations"] for record in report["records"])
+    return transfers[source, destination, tensor_bytes]
 
 
 def group_bootstrap_time_s(report: dict) -> float:
-    validate_calibration(report)
-    return max(sum(r["group_bootstrap_s"]) / report["bootstrap_rounds"] for r in report["records"])
+    _, bootstrap = calibration_times_s(report)
+    return bootstrap

@@ -20,7 +20,7 @@ class RecoveryState:
     cluster: ClusterState
     failure: FailureEvent
     layouts: tuple[tuple[tuple[str, ...], ...], ...]
-    pipeline_workers: tuple[tuple[WorkerIdentity, ...], ...]
+    pipeline_workers: tuple[tuple[WorkerIdentity | None, ...], ...]
     pipeline_micro_batches: tuple[int, ...]
     required: tuple[StateTensor, ...]
     inventories: tuple[WorkerInventory, ...]
@@ -46,7 +46,7 @@ class RecoveryState:
             raise ValueError("original micro-batch partitions must cover every pipeline")
         for count in self.pipeline_micro_batches:
             _integer("original pipeline micro-batches", count)
-        workers = tuple(w for pipeline in self.pipeline_workers for w in pipeline)
+        workers = tuple(w for pipeline in self.pipeline_workers for w in pipeline if w is not None)
         if len(workers) != len(self.cluster.workers) or set(workers) != set(self.cluster.workers):
             raise ValueError("original topology must cover each full worker identity exactly once")
         if (not isinstance(self.required, tuple) or any(not isinstance(t, StateTensor) for t in self.required)
@@ -57,7 +57,8 @@ class RecoveryState:
         failure["failed_worker_ids"] = tuple(sorted(self.failure.failed_worker_ids))
         object.__setattr__(self, "recovery_id", _hash({"failure": failure, "B": self.cluster.global_batch_size,
             "layouts": self.layouts, "micro_batches": self.pipeline_micro_batches,
-            "workers": tuple(tuple(asdict(w) for w in pipeline) for pipeline in self.pipeline_workers)}))
+            "workers": tuple(tuple(asdict(w) if w is not None else None for w in pipeline)
+                             for pipeline in self.pipeline_workers)}))
 
     @property
     def survivor_state(self):

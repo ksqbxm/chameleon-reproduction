@@ -1,6 +1,6 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。Task09 的对称分布式训练 runtime 和验收测试已实现，真实 CPU/GPU 训练因本机缺少 torch 待验；实际状态迁移恢复尚未实现，未执行真实 GPU 或训练进程 kill 测试。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。Task09 的对称分布式训练 runtime 和验收测试已实现，真实 CPU/GPU 训练因本机缺少 torch 待验；Task12 已补齐完整状态迁移与 survivor group 重建实现和验收测试，真实 CPU/GPU 训练恢复与 kill 测试仍待验。
 
 Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/Estimator/Restorer 组合已实现并审阅修正；本机指定 CPU 组合 108 passed，合同及 Task05–08 算法回归 746 passed。固定容器复验待执行；受影响真实 inventory/校准补测为 39 passed / 22 errors（缺 torch），真实训练中的策略切换按总计划在 Task13 验证。
 
@@ -23,7 +23,8 @@ Task 11 的逻辑 stage/物理 rank 分离、同 stage peer 分担、真实 acti
 | 09 | 已修正服务器报错及共用 runtime 的并发清理、提交时序和 ACK 结构；真实 CPU/GPU 待复验 | 最新共用合同68 passed、相关回归871 passed；本次真实CPU训练/profile组合17 setup errors（缺 torch）；服务器历史结果见下文 |
 | 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 最新共用合同68 passed、相关回归871 passed；本次指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
 | 11 | 实现与验收测试已编写；路由/审计合同已验；真实 CPU/GPU 待验 | 路由49 passed；相关回归219 passed / 1 deselected；指定CPU组合49 passed / 12 setup errors、7-worker CPU扩展2 setup errors，均缺torch；5/7 GPU未执行 |
-| 12-15 | 待实施 | 未执行 |
+| 12 | 已审阅修正状态校验、配置绑定、超时、空stage与控制错误处理；恢复合同/控制协议已验；真实 CPU/GPU 待验 | 恢复合同30项在组合中通过；相关组合899 passed / 1 deselected；指定CPU组合10 setup errors（缺torch），本机CUDA配置阶段退出4；未执行真实训练/GPU kill |
+| 13-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -862,6 +863,84 @@ python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed
 ```
 
 用户回传新JUnit、终端日志和本次生成的runtime审计JSON后，再更新真实CPU/GPU验收状态。
+
+## Task 12 实现与开发验证（2026-09-14）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task12、既有进度与 Runtime、模型、StateSourceMap、Hungarian/DSATUR、Restorer、DecisionCenter 和测试。仓库及父级未发现额外 AGENTS.md；修改前工作区干净。没有安装、升级、修改依赖或环境，没有访问服务器。
+- 修改范围：`src/chameleon/runtime.py`、新增 `src/chameleon/recovery.py`、`tests/conftest.py`、三个已有 topology 合同测试文件、新增 `tests/integration/test_recovery_contracts.py`、`tests/distributed/test_full_state_transfer.py`、`tests/e2e/test_kill_group_rebuild.py` 及本文件。没有实现 Task13–15。
+- 安全点状态：至少3个已提交 AdamW steps 后调用 `inspect_state()`；controller 仅保存完整 trainable parameter/step/exp_avg/exp_avg_sq 的不可变 schema，测试快照/hash 不进入 Restorer。harness 真实 kill/join 并核验 PID/非零 exitcode 后显式提交 FailureEvent；`recovery_state()` 只向 survivor 的独立控制 pipe 请求实际 inventory，拒绝错误 generation、step、存活的失败 worker 或未报告的死亡 worker。
+- generation 重建：survivor 保留原进程、原 CUDA device 和旧 module/optimizer 内存，在安全点销毁旧 subgroups/default group，使用新的 FileStore 加入 generation+1。stable worker ID 不变；dense rank 按 stable ID 重新分配。初始启动和恢复共用训练 group 创建/预热函数；没有 mock destroy/init、替补进程或重新初始化路径。
+- 完整迁移：执行前根据未经删减的 live schema 检查整个 manifest、全部 target/actions、survivor-only 完整 source、Hungarian 最少缺失 tensor 字节、DSATUR 无冲突 rounds、manifest/committed step 绑定及旧 source 生命周期。只迁移缺失 parameter/AdamW tensors；保留本地 Parameter 和 optimizer tensor 对象。每个真实 P2P tensor 携带32字节 digest 元数据用于无损验证；migration_bytes 仅统计训练状态 tensor 字节。
+- 无初始化恢复：每个 worker 初始启动时保留 tensor-free meta 模型结构；meta tensors 不含可恢复的训练值。恢复时复制结构，以旧本地 Parameter 或收到的 tensor 装配 module，使用旧 AdamW defaults 创建新容器，并逐参数加载旧 step/exp_avg/exp_avg_sq。不调用模型构造/seed/reset 初始化，不读取 checkpoint/reference。每参数实际 step 和两个 moments 的非零数量可审计。
+- 提交顺序：先收齐 survivor group ACK，再完成迁移与全部 target tensor/hash/本地对象/仍存活旧 source 验证；之后重建并核验所有训练 groups、owner names、PID、backend 和新 identity。所有 target 已验证后才发 install，worker 此时释放不再需要的旧 source，controller 收齐 install ACK 后提交新 topology，committed step 仍为3。失败或硬超时关闭并审计本 runtime 的全部原/retired PID 与全部 generation rendezvous 文件/目录；不会提交可继续使用的半个 topology。worker 不完整 AdamW 错误保留 `UnrecoverableStateError` 分类。
+- topology 描述符现在可表达已经提交的训练状态；禁止重新初始化非零 committed step 的检查移到 Runtime 初始构造入口，并更新对称/dynamic/rerouting 三类合同断言。恢复直接使用新状态描述符，不能把它作为新训练初始化入口。
+- 真实验收场景：DP2/PP2、4 workers、B=11、partial micro-batch，在3次真实训练提交后 kill 一个末 stage worker，3 survivors 原 PID 加入新 generation。测试比较 embedding、两个 blocks、final norm、head 全部四类状态的迁移前后 hash；检查缺失-only P2P 字节、保留本地对象和 ACK 前仍持有待释放 source；之后继续2 steps，对照独立 full-batch reference 的 loss、全部 gradients/parameters/AdamW。reference 在 runtime 关闭后构建，不提供给恢复逻辑。
+- 真实异常测试：删除一个 manifest tensor；kill 后删除唯一健康 lm_head optimizer source 的 exp_avg；实际 P2P 后注入 transfer error；实际 survivor group/迁移后在训练 group 阶段注入 hang。均要求保持旧 topology/generation/committed step、不记录成功 recovery、finally 清理全部 PID 和 store。worker spy 禁止第二次初始化及任何 torch.load；不能用初始化值或测试快照补缺。
+- 决策测试边界：真实验收通过 DecisionCenter 构造 rerouting 与 Algorithm1 best-dynamic 两个 candidate，再以 Equation8、caller D=100 选择唯一动态 plan。compute 来自独立实测 profile；仅将缺失的 dynamic transition 校准替换为明确标注的受控0.01秒测试值，不宣称实际 transition 为该值。实际 group/迁移/训练 group install 耗时分别测量并报告。两策略随 D 的真实切换验收仍在 Task13。
+- 可执行的额外协议验证：两个标准库 spawn 场景使用明确的 `metadata` backend，四个真实进程在3步控制协议提交后 kill 一个，验证三个 survivor 的完整 recover/joined/moved/staged/install 流程及下一次协议提交；另验证错误 target digest 在提交前拒绝并清理。此 harness 没有模型、训练 tensors、Gloo/NCCL 或模拟 process groups，其进程 kill 与清理结果不能替代训练/GPU kill 验收。
+
+实际命令与结果（本机 Windows / Python3.13.12 / pytest9.1.1，无torch）：
+
+| 阶段 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 初版 `python -m pytest tests/integration/test_recovery_contracts.py -q --device cpu --tb=short` | 0 | 18 passed |
+| 首次 Runtime 合同组合（恢复合同、runtime、dynamic runtime三个文件） | 1 | 85 passed / 1 failed；新增 `_collect` survivor 过滤在已有单独frame harness的空process列表上越界 |
+| 修正过滤后最窄 `-k 'oversized or manifest or target_ack or audit'` | 0 | 19 passed / 43 deselected；复现的frame失败已修正 |
+| runtime/dynamic/routing/recovery四文件组合 | 0 | 135 passed；该阶段尚未加入两个恢复协议场景和4项后续边界测试 |
+| 加入两个标准库恢复协议场景后的恢复合同 | 0 | 20 passed；正常安装/错误digest拒绝均实际spawn并kill，清理通过 |
+| 最终恢复合同：`python -m pytest tests/integration/test_recovery_contracts.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task12-recovery-contracts.xml` | 0 | 24 passed / 0 failures/errors/skipped |
+| runtime/topology/routing/recovery/schedule/Estimator/Planner/state-source/Hungarian/DSATUR/selector/profile schema 17文件组合，完整文件列表见下文 | 0 | 890 passed / 1 deselected / 0 failures/errors/skipped；唯一排除项为需要torch的live profile roundtrip |
+| 指定CPU：`python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -q --device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task12-cpu.xml` | 1 | 9 setup errors，均缺torch；没有spawn训练workers，没有真实Gloo/P2P/AdamW/训练kill执行 |
+| 本机尝试CUDA：`python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -q --device cuda --world-size 4 --require-gpu --tb=short` | 4 | pytest配置阶段 `No module named 'torch'`；没有GPU执行，没有skip/fallback |
+| `python -m compileall -q src tests`；`git diff --check`；最终代码/调用方/状态释放顺序/JUnit统计复核 | 0 | 通过；没有运行未声明工具 |
+
+完整回归命令（17文件，与实际890项报告对应）：
+
+```bash
+python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py tests/integration/test_routing_accounting.py tests/integration/test_recovery_contracts.py tests/unit/test_1f1b_schedule.py tests/unit/test_estimators.py tests/unit/test_integer_partitions.py tests/unit/test_batch_distribution.py tests/unit/test_layer_distribution.py tests/integration/test_dynamic_planner_oracle.py tests/unit/test_state_sources.py tests/unit/test_hungarian.py tests/unit/test_coloring.py tests/integration/test_plan_restorer.py tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py tests/integration/test_profile_roundtrip.py -q --device cpu --world-size 4 -k 'not live_profile_roundtrip' --tb=short --junitxml=artifacts/test-results/task12-regression.xml
+```
+
+- 报告位于 `artifacts/test-results/task12-{recovery-contracts|contracts|regression|cpu}.xml`、`task12-regression.log`、`task12-cpu.log`、`task12-gpu-local.log` 和 `task12-local-summary.json`；runtime协议审计为同目录 `runtime-*.json`。多次协议重跑得到的成功recover报告均backend=metadata、clean=True、四个原PID均已死；正常场景3个survivor exitcode=0、被kill进程非零，store/目录全部删除。失败场景也通过本runtime清理断言。
+- 未验证项：真实CPU/Gloo完整状态P2P、AdamW续训数值及真实训练kill；4 GPU/NCCL generation重建、状态hash/P2P与两步续训；实际通信异常/hang清理；受共用初始模型结构/group helper影响的Task09/10/11真实训练回归。没有修改容差、skip GPU、mock NCCL、补位或从reference恢复。Task12不能标完成或“CPU已验”，当前状态为实现/合同已验，真实CPU/GPU待验。
+
+固定容器验收入口（从项目工作目录，既有python，不安装或改动环境）：
+
+```bash
+python -m pytest tests/integration/test_recovery_contracts.py -q --device cpu --world-size 4 --junitxml=artifacts/test-results/task12-server-contracts.xml
+python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -q --device cpu --world-size 4 --junitxml=artifacts/test-results/task12-server-cpu.xml
+python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/task12-server-gpu.xml
+```
+
+共用训练路径回归按既有Task09/10/11的4/8/5 GPU命令运行；用户回传CPU/GPU JUnit、终端日志与本次生成的runtime审计JSON后，再确认Task12验收通过并更新状态。
+
+## Task 12 代码审阅与优化（2026-09-14）
+
+- 按正确性、完备性、简洁性审阅当前 Task12 改动，并再次阅读 `CLAUDE.md`、总计划及 Task12。修改限定在恢复相关逻辑与回归测试；没有改动依赖、环境、容差或服务器，没有添加兼容路径。
+- 修正状态校验：原 dynamic ACK 只比较重建后 source/target，不能发现 source 在重建期间改变；rerouting 只比较 metadata，不能发现值改变。现在恢复预检查现场读取完整 survivor hash，全部 target ACK 后逐 worker/tensor 与同次预检查比较，再进入训练 group/install。hash 来自当前 survivor 的实际 tensor，仅是完整性元数据；不从测试/reference/checkpoint获取状态或hash，不传入 Restorer。
+- 修正动态配置绑定：恢复构造 DynamicTopology 曾绕过 `from_plan()` 的配置校验。现在执行前核验 plan profile 的完整 ModelConfig hash，错误 seed/配置在创建新 store 或发送 recover 前拒绝。
+- 修正超时：原实现嵌套调用公开 `recovery_state()`，之后重新开始计时。现在公开检查和恢复共用单一 `_inspect_recovery()` 实现，recover 的预检查、group 重建、迁移与 install 使用同一 deadline；预检查耗尽预算时不会开始 group 重建。
+- 修正已有空 stage：RecoveryState 的逻辑 slot 正式允许 None，仅实际 worker 参与 identity 覆盖和 survivor inventory；recovery_id 保留 None，Runtime 的两处 rank/identity 映射也保留它。验证连续两个控制协议安全点 kill、4→3→2 原进程恢复及 DecisionCenter 对已有空 slot 的两个真实算法候选生成；这些是 metadata/算法测试，不宣称 Task14 的真实训练连续故障验收。
+- 修正控制错误竞态：移除抢先检查所有 process exitcode 的逻辑，先读取独立 pipe 中已发布的具体错误；无回复退出由 EOF 明确报错。`UnrecoverableStateError` 不再被其它 healthy ACK 与退出码的到达顺序掩盖。
+- 简化缓存与 ACK：缓存仅为稳定 tensor schema，删除 `_inventory_step` 及其过期判断；继续训练后恢复现场检查当前 committed step 的完整 live AdamW 状态。仍要求至少3次提交，真实验收场景不变。删除 controller 在全部 target 审计已验证后自行逐 action 填充 MigrationAcknowledgements 的重复循环，仅保留 actual ACK 验证→groups→install→commit 的唯一路径；Task07独立 ACK 合同保持原样。
+- 回归补充：新增9项算法/控制回归，覆盖两策略值损坏、源/目标一致变更、错误模型配置、预检查超时、已缺失逻辑 slot 后再次恢复、候选生成、缓存 schema 后继续训练、具体错误分类和 EOF。真实 P2P 异常验收新增 `source_mutation`：现场改变旧 AdamW moment，再执行原始完整 P2P，要求拒绝提交并清理；没有 mock group/通信。
+
+实际结果（Windows / Python3.13.12 / pytest9.1.1，无torch）：
+
+| 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 新增恢复复现测试，`tests/integration/test_recovery_contracts.py` | 1 | 24 passed / 5 failed，分别复现两个状态校验问题、配置绕过、超时重置及 None 索引错误 |
+| 最窄错误 pipe 复现，`-k 'pending_worker_error or exit_without_reply'` | 1 | 2 failed，复现具体错误被退出码掩盖及裸 EOF |
+| 缓存 schema 后继续训练复现，`-k refreshes_live_state` | 1 | 1 failed，复现仅 schema 的缓存被 step 变化错误判过期 |
+| 首轮修正，恢复/runtime/dynamic/routing/DecisionCenter 五文件组合 | 0 | 207 passed；此时尚未增加缓存 schema 回归 |
+| 最窄补全，`-k 'missing_logical_slots or preexisting_missing'` | 0 | 2 passed / 87 deselected，验证第二次实际控制恢复与候选生成 |
+| 最终17文件相关回归，完整文件列表沿用上一节，JUnit 改为 `artifacts/test-results/task12-review-regression.xml` | 0 | 899 passed / 1 deselected / 0 failures/errors/skipped；唯一排除项仍是需要torch的live profile roundtrip，30项恢复合同全部包含在通过项中 |
+| Task12指定两个文件，`--device cpu --world-size 4 --tb=short --junitxml=artifacts/test-results/task12-review-cpu.xml` | 1 | 10 setup errors，全部缺torch，没有spawn训练worker或执行真实P2P |
+| 相同两个文件，`--device cuda --world-size 4 --require-gpu --tb=short` | 4 | 配置阶段 `No module named 'torch'`，没有GPU执行或skip/fallback |
+| `python -m compileall -q src tests`；`git diff --check`；最终差异及JUnit/资源审计复核 | 0 | 语法、diff及审计检查通过 |
+
+- 修改范围：`src/chameleon/runtime.py`、`src/chameleon/decision_center.py`、`tests/unit/test_runtime_contracts.py`、`tests/integration/test_recovery_contracts.py`、`tests/integration/test_decision_center_oracle.py`、`tests/conftest.py`、`tests/distributed/test_full_state_transfer.py` 与本文件。原 Task12 其它改动保留，没有清理无关旧代码。
+- 日志/报告：`artifacts/test-results/task12-review-{red|errors-red|schema-red|contracts|missing-slots|regression|cpu}.xml`、`task12-review-{red|contracts|regression|cpu}.log`、`task12-review-gpu-local.log`；统计与本次协议资源审计保存为 `task12-review-summary.json`。最终回归实际产生8个恢复协议运行（3成功、5拒绝）；全部backend=metadata、clean=True，均清理4个原PID，无存活worker、全部generation store已删除；连续恢复场景3个store、2个retired被kill PID均被审计。
+- 未验证项：新增真实 source mutation 拒绝与 Task12 全部 CPU/Gloo、GPU/NCCL、AdamW续训、真实训练group异常/hang清理，以及共享 Runtime 的Task09–11训练回归，仍须按上一节固定容器入口执行。没有把本机协议测试等同真实训练验收；Task12仍不能标完成。
 
 ## 每次完成小功能的记录格式
 

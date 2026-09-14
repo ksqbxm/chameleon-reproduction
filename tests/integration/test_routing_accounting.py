@@ -88,7 +88,7 @@ def test_invalid_pipeline_stage_or_micro_batch(task):
 def test_committed_state_cannot_be_initialized_and_step_identity_cannot_change():
     current = topology()
     with pytest.raises(ValueError, match="already committed"):
-        replace(current, state=replace(current.state, committed_global_step=1))
+        SymmetricRuntime(replace(current, state=replace(current.state, committed_global_step=1)))
     with pytest.raises(ValueError, match="topology"):
         current.micro_batches(replace(current.state, generation=3,
                                       workers=tuple(replace(w, generation=3) for w in current.state.workers)), 0)

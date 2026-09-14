@@ -62,7 +62,6 @@ def test_invalid_layouts(stages):
 
 @pytest.mark.parametrize("change,match", [
     ({"global_batch_size": 12}, "batch sizes"),
-    ({"committed_global_step": 1}, "already committed"),
     ({"workers": tuple(WorkerIdentity(f"w{i}", i + 1, 3) for i in range(4))}, "dense ranks"),
     ({"workers": tuple(WorkerIdentity(f"w{i}", i, 3) for i in range(3))}, "fill"),
 ])
@@ -70,6 +69,13 @@ def test_invalid_cluster(change, match):
     value = topology()
     with pytest.raises(ValueError, match=match):
         replace(value, state=replace(value.state, **change))
+
+
+def test_initial_runtime_rejects_reinitializing_committed_topology():
+    current = topology()
+    recovered = replace(current, state=replace(current.state, committed_global_step=3))
+    with pytest.raises(ValueError, match="already committed"):
+        SymmetricRuntime(recovered)
 
 
 @pytest.mark.parametrize("batch,micro", [(1, 1), (5, 2)])
@@ -216,6 +222,45 @@ def _collect_incomplete_frame(incoming, result, value):
     finally:
         connection.close()
         result.close()
+
+
+def test_pending_worker_error_is_read_before_exit_status(metadata_runtime, monkeypatch):
+    from types import SimpleNamespace
+    from chameleon import runtime as module
+    from chameleon.contracts import UnrecoverableStateError
+    runtime = metadata_runtime
+    runtime.root.mkdir(parents=True, exist_ok=True)
+    pipes = [mp.Pipe() for _ in range(2)]
+    try:
+        with tempfile.TemporaryDirectory(prefix="runtime-error-", dir=runtime.root) as directory:
+            runtime.directory, runtime.origin = Path(directory), time.monotonic()
+            runtime.connections = [parent for parent, _ in pipes]
+            runtime.processes = [SimpleNamespace(exitcode=None), SimpleNamespace(exitcode=1)]
+            module._write_reply(pipes[0][1], directory, 0, "ready", runtime.topology.ranks[0])
+            module._write_reply(pipes[1][1], directory, 1, "error", runtime.topology.ranks[1],
+                                error="missing lm_head exp_avg", unrecoverable=True)
+            pipes[1][1].close()
+            # The healthy reply can become readable first while another worker has already exited.
+            monkeypatch.setattr(module, "wait", lambda pending, timeout: pending[:1])
+            with pytest.raises(UnrecoverableStateError, match="missing lm_head exp_avg"):
+                runtime._collect("ready", runtime.origin + runtime.timeout_s)
+    finally:
+        for parent, child in pipes:
+            parent.close()
+            child.close()
+
+
+def test_worker_exit_without_reply_is_reported(metadata_runtime):
+    runtime = metadata_runtime
+    parent, child = mp.Pipe()
+    child.close()
+    try:
+        runtime.connections, runtime.processes = [parent], []
+        runtime.origin = time.monotonic()
+        with pytest.raises(RuntimeError, match="worker exited before"):
+            runtime._collect("ready", runtime.origin + runtime.timeout_s)
+    finally:
+        parent.close()
 
 
 def test_oversized_incomplete_control_frame_cannot_bypass_deadline():

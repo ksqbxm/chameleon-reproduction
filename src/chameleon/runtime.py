@@ -1,6 +1,7 @@
-"""Persistent spawned workers for initial DP/PP training at safe steps."""
+"""Persistent DP/PP training and survivor recovery at committed safe points."""
 
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 import json
@@ -13,7 +14,7 @@ import tempfile
 import time
 import traceback
 
-from .contracts import ClusterState, ModelConfig, WorkerIdentity, _finite, _integer
+from .contracts import ClusterState, FailureEvent, ModelConfig, UnrecoverableStateError, WorkerIdentity, _finite, _integer
 from .data import next_sample_ids
 from .environment import validate_device
 from .global_loss import GlobalBatchAccounting
@@ -24,11 +25,9 @@ from .profiler import _hash
 
 
 class _Topology:
-    def _validate_initial_state(self):
+    def _validate_state(self):
         if self.state.global_batch_size != self.config.global_batch_size:
             raise ValueError("cluster and model global batch sizes must match")
-        if self.state.committed_global_step != 0:
-            raise ValueError("initial runtime cannot initialize already committed training state")
         if {w.rank for w in self.state.workers} != set(range(len(self.state.workers))):
             raise ValueError("runtime requires dense ranks, independent of stable worker IDs")
 
@@ -87,7 +86,7 @@ class SymmetricTopology(_Topology):
                 or any(not isinstance(stage, tuple) or not stage for stage in self.stage_modules)
                 or tuple(name for stage in self.stage_modules for name in stage) != expected):
             raise ValueError("stages must partition every model module once in model order")
-        self._validate_initial_state()
+        self._validate_state()
         if len(self.state.workers) % self.pp_size:
             raise ValueError("symmetric workers must fill every DP/PP stage")
         if self.global_micro_batches % self.dp_size:
@@ -135,7 +134,7 @@ class DynamicTopology(_Topology):
                        or any(not isinstance(stage, tuple) or not stage for stage in layout)
                        or tuple(name for stage in layout for name in stage) != expected for layout in self.layouts)):
             raise ValueError("each pipeline must partition every model module once in model order")
-        self._validate_initial_state()
+        self._validate_state()
         if not isinstance(self.pipeline_micro_batches, tuple):
             raise ValueError("pipeline micro-batch counts must be a tuple")
         for count in self.pipeline_micro_batches:
@@ -202,7 +201,7 @@ class ReroutingTopology(_Topology):
                 or any(not isinstance(stage, tuple) or not stage for stage in self.stage_modules)
                 or tuple(name for stage in self.stage_modules for name in stage) != expected):
             raise ValueError("stages must partition every model module once in model order")
-        self._validate_initial_state()
+        self._validate_state()
         if (not isinstance(self.pipeline_ranks, tuple) or not self.pipeline_ranks
                 or any(not isinstance(row, tuple) or len(row) != self.pp_size for row in self.pipeline_ranks)):
             raise ValueError("logical pipeline rank slots must match the unchanged stage layout")
@@ -518,12 +517,50 @@ def _capture_worker_state(model, optimizer, capture_path):
                                         for name, p in parameters.items()}}, capture_path)
 
 
+def _create_training_groups(topology, rank, backend, device, dtype, timeout, groups):
+    import torch
+    import torch.distributed as dist
+
+    pipeline, _ = topology.location(rank)
+    pp_group, owner_groups = None, {}
+    # Every rank creates and warms each group in the same order, before subset P2P.
+    owners = topology.module_owners
+    rerouting = isinstance(topology, ReroutingTopology)
+    specifications = [tuple(range(len(topology.ranks)))] if rerouting else list(topology.pipeline_ranks)
+    pp_group_count = len(specifications)
+    specifications += list(dict.fromkeys(owners.values()))
+    p2p_warmup = []
+    for index, ranks in enumerate(specifications):
+        group = dist.new_group(list(ranks), timeout=timeout, backend=backend)
+        if rank in ranks:
+            groups.append(group)
+            dist.all_reduce(torch.zeros(1, device=device, dtype=dtype), group=group)
+            _synchronize(device)
+            if index == (0 if rerouting else pipeline):
+                pp_group = group
+                config = topology.config
+                shape = (min(config.micro_batch_size, config.global_batch_size),
+                         config.sequence_length, config.hidden_size)
+                if rerouting:
+                    peers = sorted({target if source == rank else source
+                                    for source, target in topology.transfer_edges if rank in (source, target)})
+                    p2p_warmup = _warm_peers(peers, rank, group, device, dtype, shape)
+                else:
+                    p2p_warmup = _warm_pipeline(ranks, rank, group, device, dtype, shape)
+            if index >= pp_group_count:
+                owner_groups.update({module: group for module, peers in owners.items() if peers == ranks})
+        dist.barrier()
+        _synchronize(device)
+    return pp_group, owner_groups, specifications, p2p_warmup
+
+
 def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous_file,
                     timeout_s, connection, origin, lr, weight_decay, behavior, directory, capture_state):
     import torch
     import torch.distributed as dist
-    from .model import build_initial_stage
+    from .model import PipelineStage, build_initial_model, _to_initial_device
     from .profiler import Profiler
+    from .recovery import inspect_live_state, transfer_state
 
     groups = []
     identity = topology.ranks[rank]
@@ -537,37 +574,16 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
         dist.init_process_group(backend, store=dist.FileStore(rendezvous_file, len(topology.ranks)),
                                 rank=rank, world_size=len(topology.ranks), timeout=timeout,
                                 device_id=device if device_kind == "cuda" else None)
-        pipeline, stage = topology.location(rank)
-        pp_group, owner_groups = None, {}
-        # Every rank creates and warms each group in the same order, before subset P2P.
+        pp_group, owner_groups, specifications, p2p_warmup = _create_training_groups(
+            topology, rank, backend, device, dtype, timeout, groups)
         owners = topology.module_owners
         rerouting = isinstance(topology, ReroutingTopology)
-        specifications = [tuple(range(len(topology.ranks)))] if rerouting else list(topology.pipeline_ranks)
-        pp_group_count = len(specifications)
-        specifications += list(dict.fromkeys(owners.values()))
-        p2p_warmup = []
-        for index, ranks in enumerate(specifications):
-            group = dist.new_group(list(ranks), timeout=timeout, backend=backend)
-            if rank in ranks:
-                groups.append(group)
-                dist.all_reduce(torch.zeros(1, device=device, dtype=dtype), group=group)
-                _synchronize(device)
-                if index == (0 if rerouting else pipeline):
-                    pp_group = group
-                    config = topology.config
-                    shape = (min(config.micro_batch_size, config.global_batch_size),
-                             config.sequence_length, config.hidden_size)
-                    if rerouting:
-                        peers = sorted({target if source == rank else source
-                                        for source, target in topology.transfer_edges if rank in (source, target)})
-                        p2p_warmup = _warm_peers(peers, rank, group, device, dtype, shape)
-                    else:
-                        p2p_warmup = _warm_pipeline(ranks, rank, group, device, dtype, shape)
-                if index >= pp_group_count:
-                    owner_groups.update({module: group for module, peers in owners.items() if peers == ranks})
-            dist.barrier()
-            _synchronize(device)
-        model = build_initial_stage(topology.config, topology.layouts[pipeline][stage], device=device, dtype=dtype)
+        pipeline, stage = topology.location(rank)
+        initial = build_initial_model(topology.config)
+        # Meta tensors contain shapes/structure only, never a recoverable parameter value.
+        structure = deepcopy(initial).to(device="meta")
+        model = _to_initial_device(PipelineStage(initial, topology.layouts[pipeline][stage]), device, dtype)
+        del initial
         optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                      lr=lr, weight_decay=weight_decay, amsgrad=False)
         _write_reply(connection, directory, rank, "ready", identity, pid=os.getpid(),
@@ -594,6 +610,64 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
                              step_id=committed.committed_global_step,
                              profile=profiler.snapshot() if profiler else None)
                 continue
+            if command == b"inspect":
+                _write_reply(connection, directory, rank, "inspect", identity,
+                             step_id=committed.committed_global_step,
+                             **inspect_live_state(model, optimizer, committed.committed_global_step))
+                continue
+            if command == b"recover":
+                target, manifest, store_path = connection.recv()
+                old_rank, old_identity = rank, identity
+                new_identity = next(w for w in target.ranks if w.worker_id == identity.worker_id)
+                for group in reversed(groups):
+                    dist.destroy_process_group(group)
+                groups.clear()
+                dist.destroy_process_group()
+                dist.init_process_group(backend, store=dist.FileStore(store_path, len(target.ranks)),
+                                        rank=new_identity.rank, world_size=len(target.ranks), timeout=timeout,
+                                        device_id=device if device_kind == "cuda" else None)
+                dist.barrier()
+                _write_reply(connection, directory, old_rank, "joined", old_identity,
+                             step_id=committed.committed_global_step, pid=os.getpid(),
+                             new_worker=asdict(new_identity), device=str(device), store=store_path)
+                if connection.recv_bytes(maxlength=7) != b"move":
+                    raise RuntimeError("recovery requires survivor group ACKs before migration")
+                if manifest is not None:
+                    candidate, candidate_optimizer, evidence = transfer_state(manifest, old_identity,
+                        {w.worker_id: w.rank for w in target.ranks}, structure, model, optimizer,
+                        device, committed.committed_global_step)
+                else:
+                    candidate, candidate_optimizer = model, optimizer
+                    evidence = inspect_live_state(model, optimizer, committed.committed_global_step)
+                _write_reply(connection, directory, old_rank, "moved", old_identity,
+                             step_id=committed.committed_global_step, **evidence)
+                if connection.recv_bytes(maxlength=7) != b"groups":
+                    raise RuntimeError("recovery requires all target tensor ACKs before training groups")
+                pp_group, owner_groups, specifications, p2p_warmup = _create_training_groups(
+                    target, new_identity.rank, backend, device, dtype, timeout, groups)
+                owners = target.module_owners
+                _write_reply(connection, directory, old_rank, "staged", old_identity,
+                             step_id=committed.committed_global_step, new_worker=asdict(new_identity),
+                             pid=os.getpid(), device=str(device), backend=backend,
+                             parameter_names=[name for name, p in candidate.named_parameters() if p.requires_grad],
+                             groups=specifications, module_owners=owners,
+                             parameter_owners={name: dist.get_process_group_ranks(owner_groups[module])
+                                               for module, peers in owners.items() if new_identity.rank in peers
+                                               for name, p in candidate.named_parameters()
+                                               if p.requires_grad and (name == module or name.startswith(module + "."))},
+                             synchronization_rounds=target.synchronization_rounds, p2p_warmup=p2p_warmup)
+                if connection.recv_bytes(maxlength=7) != b"install":
+                    raise RuntimeError("recovery requires controller install after all target validations")
+                # Every target has ACKed. Only now can obsolete source modules/state be released.
+                model, optimizer = candidate, candidate_optimizer
+                del candidate, candidate_optimizer
+                profiler = None
+                topology, identity, rank, committed = target, new_identity, new_identity.rank, target.state
+                rerouting = isinstance(topology, ReroutingTopology)
+                _write_reply(connection, directory, old_rank, "set", old_identity,
+                             step_id=committed.committed_global_step, new_worker=asdict(identity),
+                             released_after_ack=True)
+                continue
             if command != b"step":
                 raise RuntimeError("worker requires the current committed state at a safe point")
             if rank == 0 and behavior == "error":
@@ -614,9 +688,10 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
                            else dict(pp_size=max(topology.pipeline_lengths), pipeline_lengths=topology.pipeline_lengths))
                 profiler = Profiler(model, optimizer, dp_size=topology.dp_size, rank=rank, **options)
             _write_reply(connection, directory, rank, "safe", identity, step_id=committed.committed_global_step)
-    except BaseException:
+    except BaseException as exc:
         try:
-            _write_reply(connection, directory, rank, "error", identity, error=traceback.format_exc())
+            _write_reply(connection, directory, rank, "error", identity, error=traceback.format_exc(),
+                         unrecoverable=isinstance(exc, UnrecoverableStateError))
         except (OSError, EOFError):
             pass
         raise
@@ -683,6 +758,8 @@ class SymmetricRuntime:
             raise ValueError("invalid runtime test behavior")
         if Path(artifact_dir).is_absolute():
             raise ValueError("artifact_dir must be relative to the project working directory")
+        if topology.state.committed_global_step != 0:
+            raise ValueError("initial runtime cannot initialize already committed training state")
         self.topology, self.device, self.dtype = topology, device, dtype
         self.backend = validate_device(device, len(topology.ranks))
         self.timeout_s, self.capture_state = timeout_s, capture_state
@@ -691,6 +768,9 @@ class SymmetricRuntime:
         self.commit = StepCommit(topology.state)
         self.processes, self.connections, self.ready = [], [], []
         self.steps, self.audit = [], None
+        self.recoveries, self._retired = [], []
+        self._stores = []
+        self._required = None
         self._directory = None
         self._closed = False
 
@@ -704,23 +784,26 @@ class SymmetricRuntime:
             yield
         except BaseException as exc:
             self.close(str(exc))
+            if isinstance(exc, UnrecoverableStateError):
+                raise
             raise RuntimeErrorWithAudit(str(exc), self.audit) from exc
 
     def _check_deadline(self, kind, deadline):
         if time.monotonic() >= deadline:
             raise TimeoutError(f"runtime {kind} exceeded hard timeout {self.timeout_s}s")
 
-    def _collect(self, kind, deadline):
-        pending = set(range(len(self.connections)))
+    def _collect(self, kind, deadline, *, ranks=None):
+        pending = set(range(len(self.connections)) if ranks is None else ranks)
         result = {}
         while pending:
             self._check_deadline(kind, deadline)
-            if any(p.exitcode not in (None, 0) for p in self.processes):
-                raise RuntimeError("runtime worker exited abnormally")
             pipes = [self.connections[rank] for rank in sorted(pending)]
             for connection in wait(pipes, timeout=min(.1, max(0, deadline - time.monotonic()))):
                 rank = self.connections.index(connection)
-                token = connection.recv_bytes(maxlength=7)
+                try:
+                    token = connection.recv_bytes(maxlength=7)
+                except EOFError as exc:
+                    raise RuntimeError("runtime worker exited before the expected reply") from exc
                 received_s = time.monotonic() - self.origin
                 if token not in (kind.encode("ascii"), b"error"):
                     raise RuntimeError("runtime reply protocol mismatch")
@@ -729,6 +812,8 @@ class SymmetricRuntime:
                 if message.get("kind") != token.decode("ascii") or worker != self.topology.ranks[rank]:
                     raise RuntimeError("runtime reply identity or protocol mismatch")
                 if token == b"error":
+                    if message.get("unrecoverable"):
+                        raise UnrecoverableStateError(message["error"])
                     raise RuntimeError(message["error"])
                 if kind != "ready":
                     _integer("reply step_id", message.get("step_id"), 0)
@@ -749,6 +834,7 @@ class SymmetricRuntime:
             self._directory = tempfile.TemporaryDirectory(prefix="runtime-", dir=self.root)
             self.directory = Path(self._directory.name)
             self.rendezvous_file = self.directory / "store"
+            self._stores.append(self.rendezvous_file)
             context = mp.get_context("spawn")
             for rank in range(len(self.topology.ranks)):
                 parent, child = context.Pipe()
@@ -830,6 +916,196 @@ class SymmetricRuntime:
                 connection.send_bytes(b"profile")
             return [reply["profile"] for reply in self._collect("profile", deadline)]
 
+    def inspect_state(self):
+        """Cache only complete metadata at the safe point; hashes are assertion evidence."""
+        if not self.ready or self._closed or self.state.committed_global_step < 1:
+            raise RuntimeError("state inspection requires a committed safe point")
+        from .state_sources import build_state_source_map
+        with self._abort_on_error():
+            deadline = time.monotonic() + self.timeout_s
+            for connection in self.connections:
+                connection.send_bytes(b"inspect")
+            replies = self._collect("inspect", deadline)
+            inventories = self._inventories(replies)
+            required = {t.key: t for i in inventories for t in i.tensors}
+            expected_names = {name for row in self.ready for name in row["parameter_names"]}
+            if {t.parameter_name for t in required.values()} != expected_names:
+                raise RuntimeError("live inventory must cover all initial trainable parameters")
+            sources = build_state_source_map(self.state, tuple(required.values()), inventories)
+            self._required = sources.required
+            return replies
+
+    def _inventories(self, replies):
+        from .state_sources import StateTensor, WorkerInventory
+        return tuple(WorkerInventory(r["worker"], r["step_id"],
+                     tuple(StateTensor(**dict(t, shape=tuple(t["shape"]))) for t in r["tensors"])) for r in replies)
+
+    def _failure_ranks(self, failure):
+        if (not self.ready or self._closed or not isinstance(failure, FailureEvent)
+                or failure.generation != self.state.generation
+                or failure.committed_global_step != self.state.committed_global_step
+                or not set(failure.failed_worker_ids) <= {w.worker_id for w in self.state.workers}):
+            raise ValueError("failure must describe the current committed safe point")
+        failed = {w.rank for w in self.topology.ranks if w.worker_id in failure.failed_worker_ids}
+        for rank, process in enumerate(self.processes):
+            process.join(0)
+            if rank in failed:
+                if process.is_alive() or process.exitcode in (None, 0):
+                    raise ValueError("harness must confirm a real killed worker PID/exitcode before recovery")
+            elif not process.is_alive():
+                raise ValueError("FailureEvent omits a dead worker")
+        return tuple(rank for rank in range(len(self.processes)) if rank not in failed)
+
+    def recovery_state(self, failure):
+        """External harness submits the failure; only surviving control pipes participate."""
+        ranks = self._failure_ranks(failure)
+        with self._abort_on_error():
+            recovery, _ = self._inspect_recovery(failure, ranks, time.monotonic() + self.timeout_s)
+            return recovery
+
+    def _inspect_recovery(self, failure, ranks, deadline):
+        from .decision_center import RecoveryState
+        from .state_sources import build_state_source_map
+        if self.state.committed_global_step < 3 or self._required is None:
+            raise RuntimeError("recovery requires complete model metadata and at least three committed steps")
+        for rank in ranks:
+            self.connections[rank].send_bytes(b"inspect")
+        replies = self._collect("inspect", deadline, ranks=ranks)
+        inventories = self._inventories(replies)
+        survivor_state = replace(self.state, workers=tuple(self.topology.ranks[r] for r in ranks))
+        build_state_source_map(survivor_state, self._required, inventories)
+        for reply, inventory in zip(replies, inventories):
+            if (len(reply["hashes"]) != len(inventory.tensors)
+                    or {tuple(r["key"]) for r in reply["hashes"]} != {t.key for t in inventory.tensors}):
+                raise UnrecoverableStateError("incomplete live survivor state hashes")
+        recovery = RecoveryState(self.state, failure, self.topology.layouts,
+            tuple(tuple(self.topology.ranks[r] if r is not None else None for r in row)
+                  for row in self.topology.pipeline_ranks),
+            self.topology.pipeline_micro_batches, self._required, inventories)
+        return recovery, replies
+
+    def recover(self, failure, decision):
+        """Rebuild groups in the existing survivors and commit only fully validated targets."""
+        from .decision_center import PolicyDecision, ReroutingPlan
+        from .recovery import validate_manifest, validate_transfer_reports
+        from .restorer import MigrationManifest
+        from .state_sources import build_state_source_map
+
+        if not isinstance(decision, PolicyDecision) or decision.candidate.execution is None:
+            raise ValueError("recovery requires the unique selected Equation 8 execution plan")
+        ranks = self._failure_ranks(failure)
+        with self._abort_on_error():
+            deadline = time.monotonic() + self.timeout_s
+            recovery, inspected = self._inspect_recovery(failure, ranks, deadline)
+            execution = decision.candidate.execution
+            if (decision.plan.generation != self.state.generation
+                    or decision.plan.global_batch_size != self.state.global_batch_size):
+                raise ValueError("decision differs from the failed topology")
+            survivors = tuple(sorted(recovery.survivor_state.workers, key=lambda w: w.worker_id))
+            new_workers = tuple(WorkerIdentity(w.worker_id, rank, self.state.generation + 1)
+                                for rank, w in enumerate(survivors))
+            new_state = ClusterState(new_workers, self.state.global_batch_size, self.state.generation + 1,
+                                     self.state.committed_global_step)
+            dense = {w.worker_id: w.rank for w in new_workers}
+            manifest = execution if isinstance(execution, MigrationManifest) else None
+            if manifest is not None:
+                if (manifest.plan.time.derivation["profile_identity"]["config_hash"]
+                        != _hash(asdict(self.topology.config))):
+                    raise ValueError("dynamic recovery model config must match the plan profile")
+                sources = build_state_source_map(recovery.survivor_state, self._required, recovery.inventories)
+                validate_manifest(manifest, sources)
+                locations = {(slot.pipeline, slot.stage): dense[w.worker_id] for slot, w in manifest.assignments}
+                pipeline_ranks = tuple(tuple(locations[p, s] for s in range(length))
+                                       for p, length in enumerate(manifest.plan.pipeline_lengths))
+                target = DynamicTopology(new_state, self.topology.config, manifest.plan.layouts,
+                                         manifest.plan.pipeline_micro_batches, pipeline_ranks)
+            elif isinstance(execution, ReroutingPlan):
+                if execution.state != recovery:
+                    raise ValueError("rerouting decision differs from live failure/state inventory")
+                pipeline_ranks = tuple(tuple(dense[w.worker_id] if w is not None and w.worker_id in dense else None
+                                             for w in row)
+                                       for row in execution.state.pipeline_workers)
+                target = ReroutingTopology(new_state, self.topology.config, execution.state.layouts[0],
+                                          execution.state.pipeline_micro_batches, pipeline_ranks)
+                for inventory in recovery.inventories:
+                    p, s = target.location(dense[inventory.worker.worker_id])
+                    expected = {t for t in self._required if t.module_id in target.layouts[p][s]}
+                    if set(inventory.tensors) != expected:
+                        raise ValueError("rerouting must retain complete existing stage state")
+            else:
+                raise ValueError("selected execution requires a manifest or rerouting plan")
+            self._check_deadline("recovery preflight", deadline)
+            store = self.directory / f"store-generation-{new_state.generation}"
+            self._stores.append(store)
+            began = time.monotonic()
+            for rank in ranks:
+                self.connections[rank].send_bytes(b"recover")
+                self.connections[rank].send((target, manifest, str(store)))
+            joined = self._collect("joined", deadline, ranks=ranks)
+            for row in joined:
+                if (row["pid"] != self.processes[row["worker"].rank].pid
+                        or WorkerIdentity(**row["new_worker"]) != new_workers[dense[row["worker"].worker_id]]):
+                    raise RuntimeError("survivor identity/PID changed during group reconstruction")
+            joined_s = time.monotonic()
+            for rank in ranks:
+                self.connections[rank].send_bytes(b"move")
+            moved = self._collect("moved", deadline, ranks=ranks)
+            if manifest is not None:
+                validate_transfer_reports(manifest, moved)
+            else:
+                if self._inventories(moved) != recovery.inventories:
+                    raise RuntimeError("rerouting changed retained parameter/AdamW metadata")
+            field = "held_before_ack" if manifest is not None else "hashes"
+            before = sorted((r["worker"].worker_id, tuple(t["key"]), t["digest"])
+                            for r in inspected for t in r["hashes"])
+            after = sorted((r["worker"].worker_id, tuple(t["key"]), t["digest"])
+                           for r in moved for t in r[field])
+            if before != after:
+                raise UnrecoverableStateError("survivor state changed during group reconstruction or transfer")
+            validated_s = time.monotonic()
+            for rank in ranks:
+                self.connections[rank].send_bytes(b"groups")
+            staged = self._collect("staged", deadline, ranks=ranks)
+            for row in staged:
+                expected = {t.parameter_name for t in self._required
+                            if dense[row["worker"].worker_id] in target.module_owners[t.module_id]}
+                if set(row["parameter_names"]) != expected:
+                    raise RuntimeError("staged target parameter ownership differs from selected plan")
+                if (row["pid"] != self.processes[row["worker"].rank].pid or row["backend"] != self.backend
+                        or WorkerIdentity(**row["new_worker"]) != new_workers[dense[row["worker"].worker_id]]):
+                    raise RuntimeError("staged training groups have the wrong survivor identity/backend")
+            self._check_deadline("recovery", deadline)
+            for rank in ranks:
+                self.connections[rank].send_bytes(b"install")
+            installed = self._collect("set", deadline, ranks=ranks)
+            if any(not r["released_after_ack"]
+                   or WorkerIdentity(**r["new_worker"]) != new_workers[dense[r["worker"].worker_id]] for r in installed):
+                raise RuntimeError("survivor installation was not acknowledged")
+            old_processes, old_connections = self.processes, self.connections
+            order = sorted(ranks, key=lambda r: dense[self.topology.ranks[r].worker_id])
+            retired = [p for rank, p in enumerate(old_processes) if rank not in ranks]
+            self._retired.extend(retired)
+            for rank, connection in enumerate(old_connections):
+                if rank not in ranks:
+                    connection.close()
+            self.processes = [old_processes[r] for r in order]
+            self.connections = [old_connections[r] for r in order]
+            self.ready = sorted([dict(row, worker=WorkerIdentity(**row["new_worker"])) for row in staged],
+                                key=lambda r: r["worker"].rank)
+            self.topology, self.commit = target, StepCommit(new_state)
+            result = dict(failure=asdict(failure), decision=decision.derivation, policy=decision.plan.policy,
+                generation=new_state.generation, committed_global_step=new_state.committed_global_step,
+                killed=[dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in retired],
+                joined=joined, targets=moved, staged=staged, installed=installed,
+                actual_group_rebuild_s=joined_s - began, actual_transfer_validation_s=validated_s - joined_s,
+                actual_training_group_install_s=time.monotonic() - validated_s,
+                source_release_after_all_target_acks=True)
+            # Keep metadata only. No tensor values or reference state enter recovery.
+            for field in ("joined", "targets", "staged", "installed"):
+                result[field] = [dict(r, worker=asdict(r["worker"])) for r in result[field]]
+            self.recoveries.append(result)
+            return result
+
     def close(self, error=None):
         if self._closed:
             return
@@ -864,10 +1140,11 @@ class SymmetricRuntime:
             deadline = time.monotonic() + 5
             for process in self.processes:
                 process.join(max(0, deadline - time.monotonic()))
-            workers = [{"pid": p.pid, "exitcode": p.exitcode, "alive": p.is_alive()} for p in self.processes]
+            workers = [{"pid": p.pid, "exitcode": p.exitcode, "alive": p.is_alive()}
+                       for p in self.processes + self._retired]
             for connection in self.connections:
                 connection.close()
-            for process in self.processes:
+            for process in self.processes + self._retired:
                 if not process.is_alive():
                     process.close()
             self._directory.cleanup()
@@ -876,6 +1153,7 @@ class SymmetricRuntime:
                       "rendezvous_backend": "FileStore", "rendezvous_port": None,
                       "rendezvous_file": str(self.rendezvous_file),
                       "rendezvous_file_removed": not self.rendezvous_file.exists(),
+                      "rendezvous_files": [dict(path=str(path), removed=not path.exists()) for path in self._stores],
                       "rendezvous_dir": str(self.directory), "rendezvous_removed": not self.directory.exists(),
                       "committed_global_step": self.state.committed_global_step, "error": error,
                       "device": self.device, "backend": self.backend}
@@ -886,7 +1164,8 @@ class SymmetricRuntime:
         serializable = [{key: value for key, value in step.items() if key != "snapshots"} for step in self.steps]
         self.report_path = self.root / f"{self.directory.name}-{self.device}-{self.dtype}-{self.behavior}.json"
         ready = [dict(row, worker=asdict(row["worker"])) for row in self.ready]
-        self.report_path.write_text(json.dumps({"audit": self.audit, "ready": ready, "steps": serializable}, indent=2,
+        self.report_path.write_text(json.dumps({"audit": self.audit, "ready": ready, "steps": serializable,
+                                               "recoveries": self.recoveries}, indent=2,
                                               allow_nan=False), encoding="utf-8")
         if close_failed:
             raise RuntimeErrorWithAudit(error, self.audit)

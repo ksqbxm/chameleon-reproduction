@@ -51,6 +51,27 @@ def score_oracle(candidate, duration):
     return samples / duration
 
 
+def test_candidates_preserve_preexisting_missing_logical_slots():
+    center, state, profile = scenario(nm=6, dp=3, failures=(0, 3))
+    removed = state.pipeline_workers[1][1]
+    state = replace(state,
+        cluster=replace(state.cluster, workers=tuple(w for w in state.cluster.workers if w != removed)),
+        failure=replace(state.failure, failed_worker_ids=(state.pipeline_workers[0][0].worker_id,)),
+        pipeline_workers=(state.pipeline_workers[0], (state.pipeline_workers[1][0], None), state.pipeline_workers[2]))
+    rerouting, dynamic = center.evaluate_candidates(state, profile)
+    assert rerouting.feasible and dynamic.feasible
+    assert rerouting.execution.state.pipeline_workers[1][1] is None
+    assert len(rerouting.execution.routes) == 12
+    alive = set(state.survivor_state.workers)
+    for route in rerouting.execution.routes:
+        assert route.worker in alive
+        original = state.pipeline_workers[route.pipeline][route.stage]
+        if original in alive:
+            assert route.worker == original
+        else:
+            assert route.worker in {pipeline[route.stage] for pipeline in state.pipeline_workers} & alive
+
+
 def test_evaluation_combines_real_planner_estimator_and_restorer_without_selecting(monkeypatch):
     center, state, profile = scenario()
     calls = Counter()

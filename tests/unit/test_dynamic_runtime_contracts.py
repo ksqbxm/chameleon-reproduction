@@ -3,7 +3,7 @@ from dataclasses import asdict, replace
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import DynamicTopology, compare_runtime_profile
+from chameleon.runtime import DynamicTopology, SymmetricRuntime, compare_runtime_profile
 from chameleon.estimators import TimeEstimate
 from chameleon.planner import DynamicPlan
 from chameleon.profiler import _hash, _validate_parallel, _validate_trace
@@ -59,11 +59,17 @@ def test_invalid_worker_slot_maps(ranks):
         topology(ranks=ranks)
 
 
-@pytest.mark.parametrize("field,value", [("global_batch_size", 20), ("committed_global_step", 1)])
-def test_initial_topology_rejects_batch_change_or_reinitializing_committed_state(field, value):
+def test_topology_rejects_batch_change():
     current = topology()
     with pytest.raises(ValueError):
-        replace(current, state=replace(current.state, **{field: value}))
+        replace(current, state=replace(current.state, global_batch_size=20))
+
+
+def test_initial_runtime_rejects_reinitializing_committed_dynamic_state():
+    current = topology()
+    recovered = replace(current, state=replace(current.state, committed_global_step=3))
+    with pytest.raises(ValueError, match="already committed"):
+        SymmetricRuntime(recovered)
 
 
 def test_each_pipeline_requires_complete_ordered_model_including_endpoints():

@@ -3,13 +3,19 @@ import pytest
 
 def pytest_addoption(parser):
     parser.addoption("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.addoption("--world-size", type=int, default=2)
+    parser.addoption("--world-size", type=int, default=None,
+                     help="Worker count (default: 2; Task12 recovery: 4)")
     parser.addoption("--require-gpu", action="store_true", default=False)
+
+
+def _world_size(config, default=2):
+    requested = config.getoption("--world-size")
+    return default if requested is None else requested
 
 
 def pytest_configure(config):
     config._chameleon_reports = set()
-    if config.getoption("--world-size") < 1:
+    if _world_size(config) < 1:
         raise pytest.UsageError("--world-size must be >= 1")
     if config.getoption("--require-gpu") and config.getoption("--device") != "cuda":
         raise pytest.UsageError("--require-gpu requires --device cuda")
@@ -17,7 +23,7 @@ def pytest_configure(config):
     if config.getoption("--device") == "cuda":
         from chameleon.environment import validate_device
         try:
-            validate_device("cuda", config.getoption("--world-size"))
+            validate_device("cuda", _world_size(config))
         except (ImportError, RuntimeError, ValueError) as exc:
             raise pytest.UsageError(str(exc)) from exc
 
@@ -29,7 +35,7 @@ def device(request):
 
 @pytest.fixture
 def world_size(request):
-    return request.config.getoption("--world-size")
+    return _world_size(request.config)
 
 
 @pytest.fixture
@@ -78,7 +84,7 @@ def symmetric_training(request):
     from chameleon.runtime import SymmetricRuntime, SymmetricTopology
 
     device = request.config.getoption("--device")
-    if request.config.getoption("--world-size") != 4:
+    if _world_size(request.config) != 4:
         pytest.fail("Task09 DP2/PP2 acceptance requires --world-size 4")
     if device == "cuda":
         validate_container(environment_report())
@@ -127,7 +133,7 @@ def asymmetric_training(request):
 
     device = request.config.getoption("--device")
     size = 8 if device == "cuda" else 7
-    if request.config.getoption("--world-size") != size:
+    if _world_size(request.config) != size:
         pytest.fail(f"Task10 acceptance requires --world-size {size} on {device}")
     if device == "cuda":
         validate_container(environment_report())
@@ -165,7 +171,7 @@ def rerouted_run(request):
     from chameleon.runtime import ReroutingTopology, SymmetricRuntime
 
     device = request.config.getoption("--device")
-    size = request.config.getoption("--world-size")
+    size = _world_size(request.config)
     validate_device(device, size)
     if device == "cuda":
         validate_container(environment_report())
@@ -192,7 +198,7 @@ def rerouted_run(request):
 
 @pytest.fixture(scope="module")
 def rerouted_training(rerouted_run, request):
-    if request.config.getoption("--world-size") != 5:
+    if _world_size(request.config) != 5:
         pytest.fail("Task11 DP3/PP2 acceptance requires --world-size 5")
     return rerouted_run(((0, None), (1, 2), (3, 4)), (5, 3, 2))
 
@@ -263,6 +269,8 @@ def _guarded_recovery_worker(*args, fault="normal"):
 
 @pytest.fixture(scope="module")
 def recovery_setup(request):
+    if _world_size(request.config, default=4) != 4:
+        pytest.fail("Task12 DP2/PP2 acceptance requires --world-size 4")
     import torch
     from chameleon import ClusterState, ModelConfig, WorkerIdentity
     from chameleon.environment import environment_report, validate_container, validate_device
@@ -271,8 +279,6 @@ def recovery_setup(request):
     from chameleon.runtime import SymmetricTopology
 
     device = request.config.getoption("--device")
-    if request.config.getoption("--world-size") != 4:
-        pytest.fail("Task12 DP2/PP2 acceptance requires --world-size 4")
     validate_device(device, 4)
     if device == "cuda":
         validate_container(environment_report())

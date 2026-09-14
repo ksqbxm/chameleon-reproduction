@@ -23,7 +23,7 @@ Task 11 的逻辑 stage/物理 rank 分离、同 stage peer 分担、真实 acti
 | 09 | 已修正服务器报错及共用 runtime 的并发清理、提交时序和 ACK 结构；真实 CPU/GPU 待复验 | 最新共用合同68 passed、相关回归871 passed；本次真实CPU训练/profile组合17 setup errors（缺 torch）；服务器历史结果见下文 |
 | 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 最新共用合同68 passed、相关回归871 passed；本次指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
 | 11 | 实现与验收测试已编写；路由/审计合同已验；真实 CPU/GPU 待验 | 路由49 passed；相关回归219 passed / 1 deselected；指定CPU组合49 passed / 12 setup errors、7-worker CPU扩展2 setup errors，均缺torch；5/7 GPU未执行 |
-| 12 | 已审阅修正状态校验、配置绑定、超时、空stage与控制错误处理；恢复合同/控制协议已验；真实 CPU/GPU 待验 | 恢复合同30项在组合中通过；相关组合899 passed / 1 deselected；指定CPU组合10 setup errors（缺torch），本机CUDA配置阶段退出4；未执行真实训练/GPU kill |
+| 12 | 恢复实现及省略worker规模的入口已修正；合同/控制协议已验；真实 CPU/GPU 待验 | 最新入口合同10 passed、恢复/DecisionCenter组合90 passed；全量unit805 passed / 81 errors（缺torch）；真实CPU组合10 setup errors（缺torch），CUDA配置阶段退出4；未执行真实训练/GPU kill |
 | 13-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
@@ -959,6 +959,29 @@ python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_ki
 
 - 报告/日志：`artifacts/test-results/task12-server-log-recheck-{minimal|suite|unit}.xml`、同名 `.log`、`task12-server-log-recheck-gpu.log` 与 `task12-server-log-recheck-summary.json`。JUnit错误分类逐项核对，全部本机error均为ModuleNotFoundError。源码未改动；仅本进度文件与忽略的运行报告新增。
 - 服务器后续顺序：最小成功恢复入口加 `--device cpu --world-size 4 -vv --tb=long`；完整两个文件加同样参数；`python -m pytest tests/unit -q --device cpu --world-size 4 --tb=short`；最后完整两个文件加 `--device cuda --world-size 4 --require-gpu -vv --tb=long`。保留完整worker traceback、JUnit及本次生成的runtime审计JSON，再根据实际第一处运行时异常判断是否需要修改共享production根因。Task12真实CPU/GPU恢复验收状态仍为待验。
+
+## Task 12 默认worker规模入口优化（2026-09-14）
+
+- 用户再次回传首个setup error，命令仍省略 `--world-size`。实际根因仍为pytest将未指定规模直接解析成2，Task12固定4-worker的fixture因此提前拒绝；没有worker traceback，不能据此诊断transfer或process-group故障。按用户要求修正入口，让这条不传规模的命令可直接选择Task12的4-worker场景。
+- 唯一参数路径：parser使用None表示未指定，经 `_world_size()` 解析；普通测试默认2，Task12默认4，显式值原样保留。共享conftest内所有规模读取均使用该解析器，避免None进入数值比较或worker创建；其它场景已有显式规模要求/默认行为保持。Task12仍只允许实际4-worker拓扑，错误显式规模在导入torch、profile/worker初始化前拒绝；`validate_device(device, 4)`及后续实际PID/拓扑断言保持。
+- 修改范围：`tests/conftest.py`、`tests/unit/test_pytest_options.py`、`docs/tasks/12_complete_state_recovery.md` 与本文件。runtime、恢复/迁移实现、regex、hash/atomicity/source lifetime/checkpoint/cleanup检查未改动；没有将全局规模改成4，没有增加旧参数兼容或训练兜底路径，没有安装、升级或修改环境。Task12文档补充省略规模时用4及默认device仍CPU的说明。
+- 新增7项真实CLI边界回归：实际pytest解析未指定规模、显式4、等号形式显式2与显式8；验证实际Task12入口拒绝显式2/3/5且没有进入torch导入。解析回归只读取参数/默认值，没有训练模型、mock进程组或替代分布式验收。
+
+实际结果（本机Windows / Python3.13.12 / pytest9.1.1，无torch；按最窄→最小训练入口→完整distributed/e2e→全量unit顺序执行）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 新增入口回归、实现前，`tests/unit/test_pytest_options.py` | 1 | 3 passed / 7 failed；新解析器尚未实现，错误规模校验也晚于torch导入 |
+| `python -m pytest tests/unit/test_pytest_options.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task12-entry-contracts.xml` | 0 | 10 passed / 0 failures/errors/skipped |
+| `python -m pytest tests/distributed/test_full_state_transfer.py::test_complete_model_and_adamw_hashes_survive_missing_only_p2p -vv --tb=long -x --junitxml=artifacts/test-results/task12-entry-minimal.xml` | 1 | 1 setup error，缺torch；省略规模的入口已通过4-worker检查，没有启动训练worker |
+| `python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -vv --tb=long --junitxml=artifacts/test-results/task12-entry-suite.xml` | 1 | 10 setup errors，全部缺torch；未传规模，未发生原数量检查错误 |
+| 同两个文件，`-vv --tb=long --device cuda --require-gpu` | 4 | 配置阶段缺torch；无GPU执行、skip或fallback |
+| `python -m pytest tests/unit -q --device cpu --tb=short --junitxml=artifacts/test-results/task12-entry-unit.xml` | 1 | 805 passed / 81 errors / 0 failures/skipped；逐项核对81项均缺torch，未排除任何unit测试 |
+| `python -m pytest tests/integration/test_recovery_contracts.py tests/integration/test_decision_center_oracle.py -q --device cpu --tb=short --junitxml=artifacts/test-results/task12-entry-recovery-regression.xml` | 0 | 90 passed / 0 failures/errors/skipped，包含实际标准库metadata恢复协议与算法候选生成 |
+| `python -m compileall -q src tests`；`git diff --check`；最终参数读取/差异/JUnit/协议资源审计复核 | 0 | 语法、diff及审计检查通过 |
+
+- 日志/报告：`artifacts/test-results/task12-entry-{red|contracts|minimal|suite|unit|recovery-regression}.xml`、同名 `.log`、`task12-entry-gpu.log` 与 `task12-entry-summary.json`。本次恢复合同实际产生8个metadata协议运行，全部clean=True、4个原PID无存活、所有generation store已删除；该结果不代表真实Gloo/NCCL训练或训练清理验收。
+- 未验证项：服务器真实CPU/GPU训练恢复、全部状态hash/P2P/续训数值、异常注入与实际process-group hang/cleanup，以及Task09–11训练回归。当前已修正的是CLI默认规模；服务器应更新本次代码后重跑原命令获取首个实际worker异常。GPU验收仍必须显式加 `--device cuda --world-size 4 --require-gpu`，本机结果不替代服务器验收，Task12状态仍为真实路径待验。
 
 ## 每次完成小功能的记录格式
 

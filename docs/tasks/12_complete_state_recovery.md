@@ -14,6 +14,8 @@
 
 ## 必须运行
 
+本验收场景固定使用4个真实workers。省略 `--world-size` 时使用4；显式指定的值必须为4。省略 `--device` 时仍为CPU，GPU验收必须显式选择CUDA。
+
 ```powershell
 python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_kill_group_rebuild.py -q --device cpu --world-size 4
 ```

@@ -51,7 +51,8 @@ class _Topology:
     def module_owners(self):
         return {module: tuple(sorted(self.pipeline_ranks[p][s]
                                     for p, layout in enumerate(self.layouts)
-                                    for s, stage in enumerate(layout) if module in stage))
+                                    for s, stage in enumerate(layout)
+                                    if module in stage and self.pipeline_ranks[p][s] is not None))
                 for module in (name for stage in self.layouts[0] for name in stage)}
 
     @property
@@ -185,6 +186,85 @@ class DynamicTopology(_Topology):
                    plan.layouts, plan.pipeline_micro_batches, ranks)
 
 
+@dataclass(frozen=True)
+class ReroutingTopology(_Topology):
+    """Initial logical slots, with missing tasks served by existing same-stage peers."""
+    state: ClusterState
+    config: ModelConfig
+    stage_modules: tuple[tuple[str, ...], ...]
+    pipeline_micro_batches: tuple[int, ...]
+    pipeline_ranks: tuple[tuple[int | None, ...], ...]
+
+    def __post_init__(self):
+        expected = ("embedding", *(f"blocks.{i}" for i in range(self.config.num_layers)),
+                    "final_norm", "lm_head")
+        if (not isinstance(self.stage_modules, tuple) or not self.stage_modules
+                or any(not isinstance(stage, tuple) or not stage for stage in self.stage_modules)
+                or tuple(name for stage in self.stage_modules for name in stage) != expected):
+            raise ValueError("stages must partition every model module once in model order")
+        self._validate_initial_state()
+        if (not isinstance(self.pipeline_ranks, tuple) or not self.pipeline_ranks
+                or any(not isinstance(row, tuple) or len(row) != self.pp_size for row in self.pipeline_ranks)):
+            raise ValueError("logical pipeline rank slots must match the unchanged stage layout")
+        ranks = tuple(rank for row in self.pipeline_ranks for rank in row if rank is not None)
+        for rank in ranks:
+            _integer("native rank", rank, 0)
+        if len(ranks) != len(self.ranks) or set(ranks) != set(range(len(self.ranks))):
+            raise ValueError("native slots must cover each physical rank exactly once; no idle workers")
+        if (not isinstance(self.pipeline_micro_batches, tuple)
+                or len(self.pipeline_micro_batches) != self.dp_size):
+            raise ValueError("pipeline micro-batch counts must match logical pipelines")
+        for count in self.pipeline_micro_batches:
+            _integer("pipeline micro-batch count", count)
+        if sum(self.pipeline_micro_batches) != self.global_micro_batches:
+            raise ValueError("pipeline micro-batch counts must preserve the global count")
+        if any(all(row[stage] is None for row in self.pipeline_ranks) for stage in range(self.pp_size)):
+            raise ValueError("rerouting infeasible: Fi >= Ndp leaves no healthy same-stage peer")
+
+    @property
+    def pp_size(self):
+        return len(self.stage_modules)
+
+    @property
+    def dp_size(self):
+        return len(self.pipeline_ranks)
+
+    @property
+    def layouts(self):
+        return (self.stage_modules,) * self.dp_size
+
+    @property
+    def pipeline_lengths(self):
+        return (self.pp_size,) * self.dp_size
+
+    @property
+    def logical_slots(self):
+        return self.dp_size * self.pp_size
+
+    def task_rank(self, pipeline, stage, micro_batch):
+        for name, value in (("pipeline", pipeline), ("stage", stage), ("micro_batch", micro_batch)):
+            _integer(name, value, 0)
+        if pipeline >= self.dp_size or stage >= self.pp_size:
+            raise ValueError("task must belong to a logical pipeline/stage")
+        if micro_batch >= self.pipeline_micro_batches[pipeline]:
+            raise ValueError("micro_batch must belong to its logical pipeline")
+        native = self.pipeline_ranks[pipeline][stage]
+        if native is not None:
+            return native
+        # Match DecisionCenter's stable peer ordering; balance all missing slots together.
+        peers = sorted((row[stage] for row in self.pipeline_ranks if row[stage] is not None),
+                       key=lambda rank: self.ranks[rank].worker_id)
+        offset = sum(self.pipeline_micro_batches[p] for p in range(pipeline)
+                     if self.pipeline_ranks[p][stage] is None)
+        return peers[(offset + micro_batch) % len(peers)]
+
+    @property
+    def transfer_edges(self):
+        return tuple(sorted({(self.task_rank(p, s, mb), self.task_rank(p, s + 1, mb))
+                             for p, count in enumerate(self.pipeline_micro_batches)
+                             for s in range(self.pp_size - 1) for mb in range(count)}))
+
+
 class RuntimeErrorWithAudit(RuntimeError):
     def __init__(self, message, audit):
         super().__init__(message)
@@ -209,11 +289,15 @@ def _synchronize(device):
 
 def _warm_pipeline(ranks, rank, group, device, dtype, shape):
     """Connect both directions of every pipeline edge before schedule-dependent P2P."""
+    stage = ranks.index(rank)
+    peers = ranks[max(0, stage - 1):stage] + ranks[stage + 1:stage + 2]
+    return _warm_peers(peers, rank, group, device, dtype, shape)
+
+
+def _warm_peers(peers, rank, group, device, dtype, shape):
     import torch
     import torch.distributed as dist
 
-    stage = ranks.index(rank)
-    peers = ranks[max(0, stage - 1):stage] + ranks[stage + 1:stage + 2]
     messages = sorted((source, target) for peer in peers
                       for source, target in ((rank, peer), (peer, rank)))
     ops, rows = [], []
@@ -318,7 +402,10 @@ def _reduce_gradients(topology, rank, model, owner_groups, origin):
 
 def _train_worker_step(topology, rank, model, optimizer, pp_group, owner_groups,
                        state, profiler, origin, capture_path):
-    import torch
+    if isinstance(topology, ReroutingTopology):
+        from .rerouting import train_rerouted_step
+        return train_rerouted_step(topology, rank, model, optimizer, pp_group, owner_groups,
+                                   state, origin, capture_path)
     import torch.distributed as dist
     from .data import make_batch
     from .global_loss import micro_batch_loss_sum
@@ -382,16 +469,9 @@ def _train_worker_step(topology, rank, model, optimizer, pp_group, owner_groups,
         if graphs:
             raise RuntimeError("pipeline left in-flight autograd graphs")
         pipeline_s = time.monotonic() - start
-        synced, allreduces = _reduce_gradients(topology, rank, model, owner_groups, origin)
-        loss_sum = torch.stack(tuple(losses.values())).sum() if losses else torch.zeros((), device=device, dtype=dtype)
         count = sum(len(batches[mb]) for mb in losses)
-        global_loss = torch.stack((loss_sum.to(torch.float64),
-                                   torch.tensor(count, device=device, dtype=torch.float64)))
-        dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
-        if global_loss[1].item() != state.global_batch_size:
-            raise RuntimeError("global sample count differs from fixed B")
-        optimizer.step()
-        _synchronize(device)
+        synced, allreduces, global_loss = _complete_update(topology, rank, model, optimizer, owner_groups,
+                                                          tuple(losses.values()), count, origin)
     completed_s = time.monotonic() - origin
     report = {"pid": os.getpid(), "pipeline": pipeline, "stage": stage,
               "sample_ids": [sample_id for batch in batches for sample_id in batch],
@@ -404,15 +484,38 @@ def _train_worker_step(topology, rank, model, optimizer, pp_group, owner_groups,
               "pipeline_wall_time_s": pipeline_s, "training_wall_time_s": completed_s - (start - origin),
               "optimizer_completed_s": completed_s, "device": str(device),
               "backend": dist.get_backend(), "profile_step": profiler.steps[-1] if profiler else None}
+    _capture_worker_state(model, optimizer, capture_path)
+    return report
+
+
+def _complete_update(topology, rank, model, optimizer, owner_groups, losses, sample_count, origin):
+    """Both execution policies share owner SUM, one normalization and AdamW."""
+    import torch
+    import torch.distributed as dist
+
+    device, dtype = next(model.parameters()).device, next(model.parameters()).dtype
+    synced, allreduces = _reduce_gradients(topology, rank, model, owner_groups, origin)
+    loss_sum = torch.stack(losses).sum() if losses else torch.zeros((), device=device, dtype=dtype)
+    global_loss = torch.stack((loss_sum.to(torch.float64),
+                               torch.tensor(sample_count, device=device, dtype=torch.float64)))
+    dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
+    if global_loss[1].item() != topology.config.global_batch_size:
+        raise RuntimeError("global sample count differs from fixed B")
+    optimizer.step()
+    _synchronize(device)
+    return synced, allreduces, global_loss
+
+
+def _capture_worker_state(model, optimizer, capture_path):
     # Test evidence is written only after the update; it is never a runtime state source.
     if capture_path is not None:
+        import torch
         parameters = {name: p for name, p in model.named_parameters() if p.requires_grad}
         torch.save({"parameters": {name: p.detach().cpu().clone() for name, p in parameters.items()},
                     "gradients": {name: p.grad.detach().cpu().clone() for name, p in parameters.items()},
                     "optimizer_state": {name: {key: value.detach().cpu().clone()
                                                for key, value in optimizer.state[p].items()}
                                         for name, p in parameters.items()}}, capture_path)
-    return report
 
 
 def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous_file,
@@ -438,7 +541,9 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
         pp_group, owner_groups = None, {}
         # Every rank creates and warms each group in the same order, before subset P2P.
         owners = topology.module_owners
-        specifications = list(topology.pipeline_ranks)
+        rerouting = isinstance(topology, ReroutingTopology)
+        specifications = [tuple(range(len(topology.ranks)))] if rerouting else list(topology.pipeline_ranks)
+        pp_group_count = len(specifications)
         specifications += list(dict.fromkeys(owners.values()))
         p2p_warmup = []
         for index, ranks in enumerate(specifications):
@@ -447,13 +552,18 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
                 groups.append(group)
                 dist.all_reduce(torch.zeros(1, device=device, dtype=dtype), group=group)
                 _synchronize(device)
-                if index == pipeline:
+                if index == (0 if rerouting else pipeline):
                     pp_group = group
                     config = topology.config
                     shape = (min(config.micro_batch_size, config.global_batch_size),
                              config.sequence_length, config.hidden_size)
-                    p2p_warmup = _warm_pipeline(ranks, rank, group, device, dtype, shape)
-                if index >= topology.dp_size:
+                    if rerouting:
+                        peers = sorted({target if source == rank else source
+                                        for source, target in topology.transfer_edges if rank in (source, target)})
+                        p2p_warmup = _warm_peers(peers, rank, group, device, dtype, shape)
+                    else:
+                        p2p_warmup = _warm_pipeline(ranks, rank, group, device, dtype, shape)
+                if index >= pp_group_count:
                     owner_groups.update({module: group for module, peers in owners.items() if peers == ranks})
             dist.barrier()
             _synchronize(device)
@@ -468,7 +578,11 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
                                        for module in topology.layouts[pipeline][stage] if name.startswith(module + ".")},
                      synchronization_rounds=topology.synchronization_rounds, p2p_warmup=p2p_warmup,
                      float32_matmul_precision=torch.get_float32_matmul_precision(),
-                     device=str(device), backend=backend)
+                     device=str(device), backend=backend,
+                     **(dict(initial_topology=dict(logical_slots=topology.logical_slots,
+                             physical_workers=len(topology.ranks), pipeline_ranks=topology.pipeline_ranks,
+                             layouts=topology.layouts, pipeline_micro_batches=topology.pipeline_micro_batches))
+                        if rerouting else {}))
         committed = topology.state
         profiler = None
         while True:
@@ -495,7 +609,7 @@ def _runtime_worker(topology, rank, device_kind, backend, dtype_name, rendezvous
             if connection.recv_bytes(maxlength=7) != b"commit":
                 raise RuntimeError("worker requires controller commit after optimizer acknowledgement")
             committed = replace(committed, committed_global_step=step_id)
-            if profiler is None:
+            if profiler is None and not rerouting:
                 options = (dict(pp_size=topology.pp_size) if isinstance(topology, SymmetricTopology)
                            else dict(pp_size=max(topology.pipeline_lengths), pipeline_lengths=topology.pipeline_lengths))
                 profiler = Profiler(model, optimizer, dp_size=topology.dp_size, rank=rank, **options)
@@ -557,7 +671,7 @@ def compare_runtime_profile(reports, topology):
 class SymmetricRuntime:
     """Controller holds identities and metadata, with no initial model backup."""
 
-    def __init__(self, topology: SymmetricTopology | DynamicTopology, *, device="cpu", dtype="float64",
+    def __init__(self, topology: SymmetricTopology | DynamicTopology | ReroutingTopology, *, device="cpu", dtype="float64",
                  timeout_s=120, artifact_dir="artifacts/test-results", capture_state=False,
                  lr=1e-3, weight_decay=.01, behavior="normal"):
         _finite("timeout_s", timeout_s, positive=True)
@@ -665,6 +779,9 @@ class SymmetricRuntime:
             replies = self._collect("ack", deadline)
             reports = [dict({key: value for key, value in reply.items() if key not in ("kind", "received_s")},
                             worker=asdict(reply["worker"])) for reply in replies]
+            if isinstance(self.topology, ReroutingTopology):
+                from .rerouting import validate_routing_reports
+                validate_routing_reports(self.topology, self.state, reports)
             accounting = GlobalBatchAccounting(self.state, expected_owners={
                 row["worker"].worker_id: set(row["parameter_names"]) for row in self.ready})
             for report in reports:
@@ -756,6 +873,7 @@ class SymmetricRuntime:
             self._directory.cleanup()
         leaked = sorted(worker["pid"] for worker in workers if worker["alive"])
         self.audit = {"workers": workers, "leaked_pids": leaked,
+                      "rendezvous_backend": "FileStore", "rendezvous_port": None,
                       "rendezvous_file": str(self.rendezvous_file),
                       "rendezvous_file_removed": not self.rendezvous_file.exists(),
                       "rendezvous_dir": str(self.directory), "rendezvous_removed": not self.directory.exists(),

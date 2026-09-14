@@ -24,7 +24,7 @@ def assert_p2p_warmup(runtime):
                 assert row["value"] == (rank if row["action"] == "send" else row["peer_rank"]) + 1
 
 
-def assert_numerical_step(actual, expected, device, *, fp32=False):
+def assert_numerical_step(actual, expected, device, *, fp32=False, owner_counts=None):
     import torch
 
     tolerance = (dict(rtol=1e-4, atol=1e-6) if fp32 else
@@ -51,7 +51,8 @@ def assert_numerical_step(actual, expected, device, *, fp32=False):
                 torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance,
                                            msg=lambda message: f"step {actual['step_id']}, {name}, AdamW.{field}: {message}")
     dp_size = len({report["pipeline"] for report in actual["reports"]})
-    assert owners == Counter({name: dp_size for name in expected.parameters})
+    assert owners == Counter(owner_counts if owner_counts is not None else
+                             {name: dp_size for name in expected.parameters})
     assert {name.split(".")[0] for name in owners} == {"embedding", "blocks", "final_norm", "lm_head"}
 
 

@@ -6,6 +6,8 @@ Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/E
 
 Task 10 的非对称新建 topology、逐参数 owner groups、DSATUR 异步 SUM、Planner/Restorer scheduling 接入与验收测试已实现。最新审阅修正了共用 runtime 的并发清理审计、提交前报告处理时序与 ACK 重复字段，以及 Profiler 的 micro-batch 顺序校验；相关合同/算法/profile schema 回归 871 passed；指定真实 CPU 组合 16 setup errors（缺 torch），GPU 未执行。不能标为完成或“CPU 已验”；状态迁移恢复仍在 Task 12。
 
+Task 11 的逻辑 stage/物理 rank 分离、同 stage peer 分担、真实 activation/gradient P2P 执行路径和验收测试已实现。路由/审计合同 49 passed，相关共用 runtime/1F1B/profile schema 回归 219 passed / 1 deselected；指定 CPU 组合 49 passed / 12 setup errors（缺 torch），7-worker CPU 扩展 2 setup errors（缺 torch）。真实训练、P2P 数值与 5/7 GPU 验收未执行，不能标为完成或“CPU 已验”；真实 kill 与 survivor 状态恢复仍在 Task 12/13。
+
 ## 状态
 
 | Task | 状态 | 实际测试 |
@@ -20,7 +22,8 @@ Task 10 的非对称新建 topology、逐参数 owner groups、DSATUR 异步 SUM
 | 08 | 已实现并审阅修正；本机 CPU 算法组合已验；固定容器与真实路径待验 | 指定两文件 108 passed；合同及 Task05–08 算法回归 746 passed；真实 inventory/校准补测 39 passed / 22 errors（缺 torch）；真实策略切换在 13 |
 | 09 | 已修正服务器报错及共用 runtime 的并发清理、提交时序和 ACK 结构；真实 CPU/GPU 待复验 | 最新共用合同68 passed、相关回归871 passed；本次真实CPU训练/profile组合17 setup errors（缺 torch）；服务器历史结果见下文 |
 | 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 最新共用合同68 passed、相关回归871 passed；本次指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
-| 11-15 | 待实施 | 未执行 |
+| 11 | 实现与验收测试已编写；路由/审计合同已验；真实 CPU/GPU 待验 | 路由49 passed；相关回归219 passed / 1 deselected；指定CPU组合49 passed / 12 setup errors、7-worker CPU扩展2 setup errors，均缺torch；5/7 GPU未执行 |
+| 12-15 | 待实施 | 未执行 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -812,6 +815,53 @@ python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed
 python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/runtime-review-server-symmetric-gpu.xml
 python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/runtime-review-server-dynamic-gpu.xml
 ```
+
+## Task 11 实现与开发验证（2026-09-14）
+
+- 已阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task10/11/12 文档及已有 Runtime、模型、调度、DecisionCenter 和验收测试。仓库及工作目录父级未发现额外 AGENTS.md；实现遵循用户提供的全局规则。修改前工作区干净；没有安装、升级或改变环境、依赖，没有访问服务器。
+- 修改范围：`src/chameleon/runtime.py`、新增 `src/chameleon/rerouting.py`、`tests/conftest.py`、共用数值断言 `tests/distributed/test_symmetric_training.py`、新增 Task11 的三个验收文件及本进度文件。共用数值断言仅增加按参数指定实际 owner 数量的支持，保留原有全部参数/梯度/AdamW检查及容差。
+- `ReroutingTopology` 保留相同 `stage_modules` 和所有逻辑 pipeline；缺失 slot 明确用 `None` 表示，物理 rank 只占一个原生 slot。每个实际 worker 都有原生任务，无 idle 备份或补位 worker。启动报告显式记录逻辑 slot 数、物理 worker 数、原布局和 `[5,3,2]` 分配。健康 slot 的任务仍由原 rank 执行，缺失任务按稳定 worker ID 在同 stage peers 间循环分配；不同缺失 pipeline 共用该 stage 的分配偏移，全部额外任务的 peer 数量差至多1。`Fi >= Ndp` 在启动前拒绝，不重分层、丢弃 pipeline 或初始化缺失 slot。
+- 每个逻辑 stage 使用原有 `build_1f1b_schedule` 的操作和依赖；每轮选择已满足依赖且物理 rank 不冲突的任务。真实 peer 在同一份本地 stage module 上执行原生和额外任务，分别按 `(pipeline, stage, micro_batch)` 保存 activation/autograd graph。每轮用 `batch_isend_irecv` 真实发送 activation 或 input gradient；所有端点按相同顺序发起P2P并等待完成，再用 barrier 结束该轮。全部可能的路由边启动时双向预热。该轮次同步实现优先验证功能正确性，包含额外 barrier 开销，不宣称复现论文吞吐率。
+- 原生和额外 backward 只累加本地 gradient SUM，未引入局部平均或任务间清零。两种执行路径复用同一个 `_complete_update`，沿用健康参数 owner groups 和 DSATUR 异步 AllReduce SUM，每个完整 gradient 只除一次固定 B，再执行 AdamW。Embedding、全部 blocks、final norm、LM head 均按真实 trainable 参数发现和同步。快照只在实际更新后供测试断言，reference 在 worker 关闭后独立创建，未传入 runtime 或恢复模块。
+- trace、P2P 和末 stage loss 记录逻辑 pipeline/stage、局部及 global micro-batch ID、sample IDs。controller 在 step commit 前验证完整任务、转移和 loss owner 集合，拒绝重复、漏任务、错 peer、错 ID/样本和错误 phase；之后仍由所有真实 worker 的 optimizer ACK 完成全局提交。清理审计明确 rendezvous 为 FileStore、TCP rendezvous port 为 `None`，记录本 runtime 的 PID/exitcode、无存活/遗留 worker 和 store/目录删除。
+- 验收测试：5个真实workers服务DP3/PP2六个逻辑slots，batch `[5,3,2]`、sample counts `[10,6,3]`、partial micro-batch；7个真实workers服务DP4/PP2八个逻辑slots，三个peer各承担两个额外任务。另覆盖首 stage 缺失、DP3/PP3中多个不同stage缺失、单micro-batch/partial、PP1与连续3步FP32。每个训练场景连续3步对照独立 full-batch reference 的 loss、所有参数/gradients/AdamW step/exp_avg/exp_avg_sq；另有真实 worker error/硬超时清理测试。1F1B数值验收使用独立手算FIFO与事件依赖断言，没有用生产调度器自证正确。
+- 算法/协议验证：穷举DP3、PP1/PP2/PP3全部仍有健康stage peer的缺失slot组合，检查任务完整、依赖和设备冲突以及均匀分担；拒绝非法布局、重复rank/idle worker、无peer、非法batch/身份及重复/错误trace、P2P和loss metadata。两个标准库spawn协议测试验证5个metadata进程正常3步提交和错路由提交前拒绝并清理；backend明确为 `metadata`，没有模拟torch、Gloo/NCCL、模型或optimizer，不能作为真实训练证据。
+- Profiler边界：当前版本化Profiler针对单worker的完整逻辑stage队列；rerouting worker的跨pipeline/部分队列只记录实际operation和P2P trace，不输出不匹配的Profiler快照或Equation9/11对照，`profile_step` 为 `None`。Task11不宣称已有rerouting profile校准闭环。
+
+实际本机执行（项目工作目录，Windows / Python3.13.12 / pytest9.1.1，缺torch；没有真实训练backend或GPU执行）：
+
+| 小功能 / 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 新增拓扑合同先运行 `python -m pytest tests/integration/test_routing_accounting.py -q --device cpu --world-size 5 --tb=short` | 1 | 1 collection error：尚无 `ReroutingTopology`；调度/审计增量先运行也因尚无 `chameleon.rerouting` 报1 collection error |
+| 拓扑实现后：`python -m pytest tests/integration/test_routing_accounting.py tests/unit/test_dynamic_runtime_contracts.py -q --device cpu --world-size 5 --tb=short --junitxml=artifacts/test-results/task11-topology.xml` | 0 | 48 passed |
+| 初版调度/审计：`python -m pytest tests/integration/test_routing_accounting.py -q --device cpu --world-size 5 --tb=short --junitxml=artifacts/test-results/task11-accounting.xml` | 0 | 39 passed |
+| Runtime接入：`python -m pytest tests/integration/test_routing_accounting.py tests/unit/test_dynamic_runtime_contracts.py tests/unit/test_runtime_contracts.py -q --device cpu --world-size 5 --tb=short --junitxml=artifacts/test-results/task11-runtime-contracts.xml` | 0 | 107 passed |
+| 补齐边界/协议/穷举：`python -m pytest tests/integration/test_routing_accounting.py -q --device cpu --world-size 5 --tb=short --junitxml=artifacts/test-results/task11-audit.xml` | 0 | 49 passed，0 failed/errors/skipped；包含2项标准库spawn协议测试 |
+| 相关组合：`python -m pytest tests/unit/test_runtime_contracts.py tests/unit/test_dynamic_runtime_contracts.py tests/integration/test_routing_accounting.py tests/unit/test_1f1b_schedule.py tests/integration/test_profile_roundtrip.py -q --device cpu --world-size 5 -k 'not live_profile_roundtrip' --tb=short --junitxml=artifacts/test-results/task11-regression.xml` | 0 | 219 passed / 1 deselected，0 failed/errors/skipped；被排除的是缺torch的真实profile roundtrip |
+| Task11指定CPU：`python -m pytest tests/distributed/test_rerouted_training.py tests/integration/test_routing_accounting.py -q --device cpu --world-size 5 --tb=short --junitxml=artifacts/test-results/task11-cpu.xml` | 1 | 最终49 passed / 12 setup errors，全部错误为缺torch；初版同命令为39 passed / 12 setup errors |
+| 额外CPU规模验证：`python -m pytest tests/distributed/test_rerouting_scale.py -q --device cpu --world-size 7 --tb=short --junitxml=artifacts/test-results/task11-scale-cpu.xml` | 1 | 2 setup errors，均缺torch，未spawn训练worker |
+| 新增三个验收文件 `--collect-only -q --device cpu --world-size 5` | 0 | 63 tests collected；仅测试发现，不代表执行，通过规模断言仍须分别按5/7 workers运行 |
+| `python -m compileall -q src tests`；`git diff --check`；最终差异/调用方/报告复查 | 0 | 语法和diff检查通过；未运行未声明工具 |
+
+- 报告/日志：`artifacts/test-results/task11-{topology|accounting|runtime-contracts|audit|regression|cpu|scale-cpu}.xml`，最终audit/regression/cpu/scale-cpu另有同名 `.log`，测试发现结果在 `task11-collection.log`；JUnit统计与缺torch错误分类已解析核对并保存为 `task11-local-summary.json`。实际运行/清理报告为同目录的 `runtime-*.json`。合同/回归通过项包含标准库metadata进程清理；真实P2P、NCCL、AdamW和训练失败/超时清理未验证。GPU命令未执行。
+- 未验证项：目标容器CPU/Gloo训练与P2P，5/7 GPU/NCCL数值/实际peer分担、全部真实训练资源清理，以及受共用update/预热helper影响的Task09/10训练回归。没有放宽FP64/FP32容差、skip GPU、mock NCCL或fallback CPU；本机合同结果不替代固定容器验收，Task11不能标完成。Task12/13负责真实kill、survivor旧状态及generation重建，本次未实现这些恢复功能。
+
+固定容器验收入口（用户在服务器项目工作目录执行，使用既有python，无需安装项目或改环境；先CPU再两个GPU规模）：
+
+```bash
+python -m pytest tests/distributed/test_rerouted_training.py tests/integration/test_routing_accounting.py -q --device cpu --world-size 5 --junitxml=artifacts/test-results/task11-server-cpu.xml
+python -m pytest tests/distributed/test_rerouted_training.py tests/integration/test_routing_accounting.py -q --device cuda --world-size 5 --require-gpu --junitxml=artifacts/test-results/task11-server-gpu.xml
+python -m pytest tests/distributed/test_rerouting_scale.py -q --device cuda --world-size 7 --require-gpu --junitxml=artifacts/test-results/task11-server-scale-gpu.xml
+```
+
+共用Runtime训练回归也需按原Task09/10规模执行：
+
+```bash
+python -m pytest tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/task11-server-symmetric-regression.xml
+python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed/test_colored_allreduce.py tests/integration/test_planner_runtime.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/task11-server-dynamic-regression.xml
+```
+
+用户回传新JUnit、终端日志和本次生成的runtime审计JSON后，再更新真实CPU/GPU验收状态。
 
 ## 每次完成小功能的记录格式
 

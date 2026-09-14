@@ -152,3 +152,46 @@ def asymmetric_training(request):
                                  ClusterState((WorkerIdentity("reference", 0, 0),), 19), lr=.007, weight_decay=.125)
     return dict(runtime=runtime, topology=topology, config=config, steps=steps,
                 profiles=profiles, reference=[reference.train_step() for _ in range(3)], device=device)
+
+
+@pytest.fixture(scope="module")
+def rerouted_run(request):
+    """Initial missing slots only; real workers and independent reference after shutdown."""
+    import torch
+    from chameleon import ClusterState, ModelConfig, WorkerIdentity
+    from chameleon.environment import environment_report, validate_container, validate_device
+    from chameleon.model import build_initial_model
+    from chameleon.reference import ReferenceTrainer
+    from chameleon.runtime import ReroutingTopology, SymmetricRuntime
+
+    device = request.config.getoption("--device")
+    size = request.config.getoption("--world-size")
+    validate_device(device, size)
+    if device == "cuda":
+        validate_container(environment_report())
+
+    def run(slots, counts, *, stages=None, batch=19, dtype="float64"):
+        config = ModelConfig(vocab_size=7, hidden_size=4, num_layers=2, num_heads=1,
+                             sequence_length=3, global_batch_size=batch, micro_batch_size=2)
+        stages = stages or (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head"))
+        workers = tuple(WorkerIdentity(f"peer-{20 - r}", r, 2) for r in reversed(range(size)))
+        topology = ReroutingTopology(ClusterState(workers, batch, generation=2), config, stages, counts, slots)
+        runtime = SymmetricRuntime(topology, device=device, dtype=dtype, capture_state=True, lr=.007, weight_decay=.125)
+        with runtime:
+            steps = [runtime.train_step() for _ in range(3)]
+            assert all(process.is_alive() for process in runtime.processes)
+        assert runtime.audit["clean"] and all(worker["exitcode"] == 0 for worker in runtime.audit["workers"])
+        torch.set_num_threads(1)
+        reference = ReferenceTrainer(build_initial_model(config, device=device, dtype=getattr(torch, dtype)),
+                                     ClusterState((WorkerIdentity("reference", 0, 0),), batch), lr=.007, weight_decay=.125)
+        return dict(runtime=runtime, topology=topology, config=config, steps=steps,
+                    reference=[reference.train_step() for _ in range(3)], device=device, dtype=dtype)
+
+    return run
+
+
+@pytest.fixture(scope="module")
+def rerouted_training(rerouted_run, request):
+    if request.config.getoption("--world-size") != 5:
+        pytest.fail("Task11 DP3/PP2 acceptance requires --world-size 5")
+    return rerouted_run(((0, None), (1, 2), (3, 4)), (5, 3, 2))

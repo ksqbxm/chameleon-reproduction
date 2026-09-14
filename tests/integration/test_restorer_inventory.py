@@ -22,6 +22,10 @@ def live_model(device):
                 parameter.grad = torch.ones_like(parameter)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+    for parameter in optimizer.param_groups[0]["params"]:
+        state = optimizer.state[parameter]
+        assert set(state) == set(ADAMW_FIELDS[1:])
+        assert state["step"].item() == 3
     return torch, model, optimizer
 
 
@@ -55,13 +59,14 @@ def test_live_missing_optimizer_tensor_fails(live_model, module, kind):
 @pytest.mark.parametrize("change", ("amsgrad", "missing_owner", "shape", "step", "stale_step", "dtype"))
 def test_live_inventory_rejects_invalid_state(live_model, change):
     torch, model, optimizer = live_model
-    parameter = next(model.parameters())
+    parameter = next(p for p in model.parameters() if p.requires_grad)
     if change == "amsgrad":
         optimizer.param_groups[0]["amsgrad"] = True
     elif change == "missing_owner":
-        optimizer.param_groups[0]["params"].remove(parameter)
+        group = optimizer.param_groups[0]
+        group["params"] = [p for p in group["params"] if p is not parameter]
     elif change == "shape":
-        optimizer.state[parameter]["exp_avg"] = torch.zeros(1)
+        optimizer.state[parameter]["exp_avg"] = parameter.new_zeros(1)
     elif change == "stale_step":
         optimizer.state[parameter]["step"].fill_(2)
     elif change == "dtype":

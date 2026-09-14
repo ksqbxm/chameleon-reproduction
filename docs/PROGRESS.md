@@ -755,6 +755,30 @@ python -m pytest tests/distributed/test_asymmetric_training.py tests/distributed
 
 回传新JUnit、终端日志与本次新生成的 runtime JSON 后再核对数值与清理。结构修复与回归已实现；不宣称尚未执行的真实训练验证通过。
 
+## Live inventory 故障注入测试修正（2026-09-14）
+
+- 用户回传服务器同一GPU组合的终端日志：101项中96 passed / 5 failed，全部失败位于 `test_live_inventory_rejects_invalid_state` 的 missing_owner/shape/step/stale_step/dtype；此前模型、reference、Profiler与对称真实训练不在此次失败列表。未附原始JUnit或runtime审计文件，以上统计与环境来自用户日志，不表示本机执行了服务器验收。
+- 按用户要求先审查 `live_model`：它已对每个 requires_grad 参数赋确定性的全1梯度，执行3次真实AdamW step，并清理梯度；所有 trainable 的状态已由optimizer自身初始化。错误目标是 `next(model.parameters())` 返回的根模块 `model.frozen`，其 requires_grad=False，未被AdamW持有，也不在inventory契约内。[PyTorch Module 源码](https://github.com/pytorch/pytorch/blob/v2.8.0/torch/nn/modules/module.py)显示参数迭代先枚举当前模块参数，再遍历子模块，因此后注册的根模块frozen仍排在embedding之前。读取其defaultdict state产生空状态，step/exp_avg读取KeyError；注入其shape不应影响trainable inventory。missing_owner 的list.remove对不在列表内的frozen执行Tensor相等比较，引发多元素Tensor布尔歧义。
+- 修复限于 `tests/integration/test_restorer_inventory.py` 与本进度文件；开始时工作区干净。保留既有3次确定性AdamW初始化，新增故障注入前全部optimizer参数的step/exp_avg/exp_avg_sq完整性与step=3断言；目标明确筛选requires_grad参数。缺owner用 `is not parameter` 过滤列表，彻底删除Tensor equality移除方式。shape用 `parameter.new_zeros(1)` 保持原dtype/device，专门破坏形状；step/stale_step/dtype继续破坏已初始化的真实trainable state。没有修改生产model、state_sources、restorer或其他validator，没有手动伪造AdamW state、放宽异常要求或增加兼容路径。
+- 审阅：形状故障现在作用于可训练embedding参数的真实exp_avg，故障前状态完整；归约/恢复校验仍要求shape/dtype/device及committed step精确匹配。冻结参数继续保留，以覆盖inventory排除非trainable的契约。
+
+实际本机执行（Windows/Python3.13.12/pytest9.1.1，缺torch；未安装或修改环境）：
+
+| 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/integration/test_restorer_inventory.py -q --device cpu --tb=short --junitxml=artifacts/test-results/restorer-inventory-focused.xml` | 1 | 19 setup errors，均为缺torch；未执行故障注入或模型训练 |
+| 用户指定的原样命令：`python -m pytest tests/unit/test_model_data.py tests/unit/test_reference.py tests/unit/test_profiler.py tests/integration/test_restorer_inventory.py tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/fp32-bias-server-gpu.xml` | 1 | 配置阶段 ERROR: No module named 'torch'，未启动GPU/worker，未生成该GPU JUnit |
+| 上述命令结束后启动：`python -m pytest tests/unit -q --device cpu --junitxml=artifacts/test-results/restorer-inventory-unit.xml` | 1 | 789 passed / 81 setup errors / 0 failures / 0 skipped；全部81个error均为缺torch。日志在 `restorer-inventory-unit.log` |
+| 最终diff审阅与 `git diff --check`；JUnit统计/错误分类解析 | 0 | 修改范围仅测试文件/进度，diff检查通过；没有生产代码变动 |
+
+- 实际统计保存在 `artifacts/test-results/restorer-inventory-local-summary.json`。789项通过不表示缺torch的模型或live optimizer测试通过。GPU组合与本次故障注入修复仍待服务器验证，不能把用户回传的旧96 passed结果当作修正后通过。
+- 用户随后明确服务器测试由用户执行、仅需测试入口；不再尝试远程连接或追加本机训练测试。按顺序在固定容器项目目录执行：
+
+```bash
+python -m pytest tests/unit/test_model_data.py tests/unit/test_reference.py tests/unit/test_profiler.py tests/integration/test_restorer_inventory.py tests/distributed/test_symmetric_training.py tests/integration/test_runtime_profile.py -q --device cuda --world-size 4 --require-gpu --junitxml=artifacts/test-results/fp32-bias-server-gpu.xml
+python -m pytest tests/unit -q --device cpu --junitxml=artifacts/test-results/restorer-inventory-server-unit.xml
+```
+
 ## 每次完成小功能的记录格式
 
 - Task / 小功能：

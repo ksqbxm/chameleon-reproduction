@@ -3,15 +3,15 @@
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
-import hashlib
 import json
 import math
 from pathlib import Path
 import platform
 import time
 
-from .contracts import _finite, _integer
+from .contracts import _finite, _integer, require_exact_fields, stable_hash
 from .schedule import build_1f1b_schedule
+from .state_sources import adamw_inventory
 
 
 SCHEMA_VERSION = 3
@@ -31,10 +31,6 @@ class Measurements:
         if series["samples"]:
             series["ema"] = self.alpha * value + (1 - self.alpha) * series["ema"]
         series["samples"].append(value)
-
-
-def _hash(value) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def profile_identity(model, *, dp_size: int = 1, pp_size: int = 1, rank: int = 0,
@@ -58,7 +54,7 @@ def profile_identity(model, *, dp_size: int = 1, pp_size: int = 1, rank: int = 0
     module_bytes = {}
     for entry in parameter_inventory(model):
         module_bytes[entry.module_id] = module_bytes.get(entry.module_id, 0) + entry.nbytes
-    return {"model_hash": _hash(architecture), "config_hash": _hash(asdict(model.config)),
+    return {"model_hash": stable_hash(architecture), "config_hash": stable_hash(asdict(model.config)),
             "module_parameter_bytes": module_bytes, "module_order": list(module_bytes),
             "device": device_identity(device),
             "parallel": parallel}
@@ -82,33 +78,21 @@ def device_identity(device) -> dict:
     return device_info
 
 
-def tensor_inventory(model, optimizer) -> dict[str, dict[str, int]]:
+def tensor_inventory(model, optimizer, *, committed_global_step: int) -> dict[str, dict[str, int]]:
     """Logical tensor bytes, grouped by the model's complete trainable inventory."""
-    import torch
     from .model import parameter_inventory
 
-    if not isinstance(optimizer, torch.optim.AdamW):
-        raise ValueError("profiling requires AdamW")
-    if any(group["amsgrad"] for group in optimizer.param_groups):
-        raise ValueError("AdamW amsgrad must be False")
     parameters = dict(model.named_parameters())
-    trainable = {p for p in parameters.values() if p.requires_grad}
-    if {p for group in optimizer.param_groups for p in group["params"]} != trainable:
-        raise ValueError("optimizer must own every trainable parameter")
-    result = {}
-    for entry in parameter_inventory(model):
-        parameter = parameters[entry.name]
-        state = optimizer.state.get(parameter, {})
-        if (set(state) != {"step", "exp_avg", "exp_avg_sq"}
-                or any(not isinstance(t, torch.Tensor) for t in state.values())
-                or state["step"].item() <= 0):
-            raise ValueError("AdamW must be warmed up to materialize its state before profiling")
-        row = result.setdefault(entry.module_id, {"parameter_bytes": 0, "gradient_bytes": 0,
-                                                  "adamw_bytes": 0})
-        row["parameter_bytes"] += entry.nbytes
-        if parameter.grad is not None:
-            row["gradient_bytes"] += parameter.grad.numel() * parameter.grad.element_size()
-        row["adamw_bytes"] += sum(t.numel() * t.element_size() for t in state.values())
+    modules = dict.fromkeys(entry.module_id for entry in parameter_inventory(model))
+    result = {module: {"parameter_bytes": 0, "gradient_bytes": 0, "adamw_bytes": 0}
+              for module in modules}
+    for tensor in adamw_inventory(model, optimizer, committed_global_step=committed_global_step):
+        row = result[tensor.module_id]
+        row["parameter_bytes" if tensor.kind == "parameter" else "adamw_bytes"] += tensor.nbytes
+        if tensor.kind == "parameter":
+            gradient = parameters[tensor.parameter_name].grad
+            if gradient is not None:
+                row["gradient_bytes"] += gradient.numel() * gradient.element_size()
     return result
 
 
@@ -243,7 +227,8 @@ class Profiler:
             raise ValueError("profiling steps cannot be nested")
         if self.identity != profile_identity(self.model, **self.identity["parallel"]):
             raise ValueError("model/config/device identity changed")
-        inventory = tensor_inventory(self.model, self.optimizer)
+        inventory = tensor_inventory(self.model, self.optimizer,
+                                     committed_global_step=step_id - 1)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -279,7 +264,8 @@ class Profiler:
                      for row, left, right in self._trace]
             _validate_trace(trace, self.identity["parallel"])
             memory = {"kind": "cuda_hbm" if self.device.type == "cuda" else "logical_tensor_bytes",
-                      "modules": tensor_inventory(self.model, self.optimizer),
+                      "modules": tensor_inventory(self.model, self.optimizer,
+                                                  committed_global_step=step_id),
                       "output_activation_bytes": dict(self._activation),
                       "saved_activation_bytes": {name: max(row[name] for row in self._saved.values())
                                                  for name in (*inventory, "loss_and_runtime")},
@@ -342,11 +328,6 @@ class Profiler:
                          "steps": self.steps, "calibrations": self.calibrations})
 
 
-def _keys(value, keys, name):
-    if not isinstance(value, dict) or set(value) != set(keys):
-        raise ValueError(f"invalid {name} fields")
-
-
 def _pipeline_depth(parallel, pipeline):
     return parallel["pipeline_lengths"][pipeline] if "pipeline_lengths" in parallel else parallel["pp_size"]
 
@@ -358,7 +339,7 @@ def _validate_trace(trace, parallel):
     previous_end = 0
     stages = {}
     for row in trace:
-        _keys(row, ("kind", "micro_batch", "pipeline", "stage", "phase", "start_s", "end_s"), "trace")
+        require_exact_fields(row, ("kind", "micro_batch", "pipeline", "stage", "phase", "start_s", "end_s"), "trace")
         for name in ("micro_batch", "pipeline", "stage"):
             _integer(name, row[name], 0)
         if row["pipeline"] >= parallel["dp_size"] or row["stage"] >= _pipeline_depth(parallel, row["pipeline"]):
@@ -390,7 +371,7 @@ def _validate_trace(trace, parallel):
 
 
 def _validate_identity(identity):
-    _keys(identity, ("model_hash", "config_hash", "module_parameter_bytes", "module_order", "device", "parallel"), "identity")
+    require_exact_fields(identity, ("model_hash", "config_hash", "module_parameter_bytes", "module_order", "device", "parallel"), "identity")
     for name in ("model_hash", "config_hash"):
         value = identity[name]
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
@@ -406,7 +387,7 @@ def _validate_identity(identity):
     if (not isinstance(order, list) or any(not isinstance(name, str) for name in order)
             or len(order) != len(module_bytes) or set(order) != set(module_bytes)):
         raise ValueError("invalid identity module order")
-    _validate_device_identity(identity["device"])
+    validate_device_identity(identity["device"])
     _validate_parallel(identity["parallel"])
 
 
@@ -414,7 +395,7 @@ def _validate_parallel(parallel):
     keys = ("dp_size", "pp_size", "rank")
     if isinstance(parallel, dict) and "pipeline_lengths" in parallel:
         keys += ("pipeline_lengths",)
-    _keys(parallel, keys, "parallel configuration")
+    require_exact_fields(parallel, keys, "parallel configuration")
     _integer("dp_size", parallel["dp_size"])
     _integer("pp_size", parallel["pp_size"])
     _integer("rank", parallel["rank"], 0)
@@ -429,12 +410,12 @@ def _validate_parallel(parallel):
         raise ValueError("invalid parallel rank")
 
 
-def _validate_device_identity(device):
+def validate_device_identity(device):
     if not isinstance(device, dict) or device.get("type") not in ("cpu", "cuda"):
         raise ValueError("invalid device identity")
     cuda = device["type"] == "cuda"
-    _keys(device, ("type", "index", "torch", "name", "total_memory_bytes", "capability", "cuda")
-          if cuda else ("type", "index", "torch", "name", "system"), "device identity")
+    require_exact_fields(device, ("type", "index", "torch", "name", "total_memory_bytes", "capability", "cuda")
+                         if cuda else ("type", "index", "torch", "name", "system"), "device identity")
     for name in (("torch", "name", "cuda") if cuda else ("torch", "name", "system")):
         if not isinstance(device[name], str) or not device[name]:
             raise ValueError("invalid device identity text")
@@ -450,7 +431,7 @@ def _validate_device_identity(device):
 
 
 def validate_snapshot(payload: dict, expected_identity: dict) -> None:
-    _keys(payload, ("schema_version", "identity", "ema_alpha", "metrics", "steps", "calibrations"), "profile")
+    require_exact_fields(payload, ("schema_version", "identity", "ema_alpha", "metrics", "steps", "calibrations"), "profile")
     if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
         raise ValueError("unsupported profile schema version")
     _validate_identity(payload["identity"])
@@ -465,7 +446,7 @@ def validate_snapshot(payload: dict, expected_identity: dict) -> None:
     for name, series in payload["metrics"].items():
         if not isinstance(name, str) or not name:
             raise ValueError("invalid metric name")
-        _keys(series, ("samples", "ema"), "metric")
+        require_exact_fields(series, ("samples", "ema"), "metric")
         if not isinstance(series["samples"], list) or not series["samples"]:
             raise ValueError("metric samples must not be empty")
         oracle = Measurements(alpha)
@@ -482,7 +463,7 @@ def validate_snapshot(payload: dict, expected_identity: dict) -> None:
         raise ValueError("missing step timing samples")
     previous_step = 0
     for index, step in enumerate(payload["steps"]):
-        _keys(step, ("step_id", "trace", "memory"), "step")
+        require_exact_fields(step, ("step_id", "trace", "memory"), "step")
         _integer("step_id", step["step_id"])
         if step["step_id"] <= previous_step:
             raise ValueError("profile step IDs must increase")
@@ -492,13 +473,13 @@ def validate_snapshot(payload: dict, expected_identity: dict) -> None:
         if step["trace"][-1]["end_s"] > payload["metrics"]["step_time_s"]["samples"][index]:
             raise ValueError("trace extends beyond measured step time")
         memory = step["memory"]
-        _keys(memory, ("kind", "modules", "output_activation_bytes", "saved_activation_bytes",
-                       "peak_allocated_bytes", "peak_reserved_bytes"), "memory")
+        require_exact_fields(memory, ("kind", "modules", "output_activation_bytes", "saved_activation_bytes",
+                                      "peak_allocated_bytes", "peak_reserved_bytes"), "memory")
         if (not isinstance(memory["modules"], dict)
                 or memory["modules"].keys() != expected_identity["module_parameter_bytes"].keys()):
             raise ValueError("module inventory must match model identity")
         for module, row in memory["modules"].items():
-            _keys(row, ("parameter_bytes", "gradient_bytes", "adamw_bytes"), "tensor inventory")
+            require_exact_fields(row, ("parameter_bytes", "gradient_bytes", "adamw_bytes"), "tensor inventory")
             for name, size in row.items():
                 _integer(name, size, 0)
             if row["parameter_bytes"] != expected_identity["module_parameter_bytes"][module]:

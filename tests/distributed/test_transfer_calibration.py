@@ -11,8 +11,10 @@ from chameleon.transfer_calibration import (
 
 
 def _failed_worker(rank, device, backend, port, directory, *args):
-    from chameleon.environment import _write_record
-    _write_record(directory, rank, {"rank": rank, "error": "injected calibration failure"})
+    from pathlib import Path
+    from chameleon.process_control import write_json_atomic
+    write_json_atomic(Path(directory, f"rank-{rank}.json"),
+                      {"rank": rank, "error": "injected calibration failure"})
     raise RuntimeError("injected calibration failure")
 
 

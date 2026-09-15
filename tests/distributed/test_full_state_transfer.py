@@ -5,7 +5,7 @@ from collections import Counter
 import pytest
 
 from chameleon.state_sources import ADAMW_FIELDS
-from test_symmetric_training import assert_numerical_step
+from conftest import assert_numerical_step
 
 
 def test_complete_model_and_adamw_hashes_survive_missing_only_p2p(recovered_training):

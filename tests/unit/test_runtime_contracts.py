@@ -12,7 +12,7 @@ import time
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import RuntimeErrorWithAudit, SymmetricRuntime, SymmetricTopology, compare_runtime_profile
+from chameleon.runtime import DistributedRuntime, RuntimeErrorWithAudit, SymmetricTopology, compare_runtime_profile
 from chameleon.step import StepCommit
 
 
@@ -75,7 +75,7 @@ def test_initial_runtime_rejects_reinitializing_committed_topology():
     current = topology()
     recovered = replace(current, state=replace(current.state, committed_global_step=3))
     with pytest.raises(ValueError, match="already committed"):
-        SymmetricRuntime(recovered)
+        DistributedRuntime(recovered)
 
 
 @pytest.mark.parametrize("batch,micro", [(1, 1), (5, 2)])
@@ -104,7 +104,7 @@ def test_step_state_cannot_change_generation_or_batch():
 ])
 def test_invalid_runtime_options_fail_before_backend_import(options):
     with pytest.raises(ValueError):
-        SymmetricRuntime(topology(), **options)
+        DistributedRuntime(topology(), **options)
 
 
 @pytest.fixture
@@ -112,7 +112,7 @@ def metadata_runtime(monkeypatch):
     from chameleon import runtime as module
     # Lifecycle/transport contracts use only stdlib metadata, never simulated training/NCCL.
     monkeypatch.setattr(module, "validate_device", lambda *_: "metadata")
-    return SymmetricRuntime(topology())
+    return DistributedRuntime(topology())
 
 
 @pytest.mark.parametrize("status", ["closed", "open"])
@@ -178,7 +178,7 @@ def test_spawn_failure_cleans_workers_already_started(metadata_runtime, monkeypa
 def test_concurrent_runtimes_have_independent_rendezvous_files(metadata_runtime, monkeypatch):
     from chameleon import runtime as module
     monkeypatch.setattr(module, "_runtime_worker", partial(_metadata_worker, fault="none"))
-    other = SymmetricRuntime(metadata_runtime.topology)
+    other = DistributedRuntime(metadata_runtime.topology)
     with metadata_runtime:
         with other:
             assert metadata_runtime.rendezvous_file != other.rendezvous_file
@@ -194,7 +194,7 @@ def test_concurrent_runtimes_have_independent_rendezvous_files(metadata_runtime,
 def test_closing_first_runtime_does_not_claim_second_workers_as_leaks(metadata_runtime, monkeypatch):
     from chameleon import runtime as module
     monkeypatch.setattr(module, "_runtime_worker", partial(_metadata_worker, fault="none"))
-    other = SymmetricRuntime(metadata_runtime.topology)
+    other = DistributedRuntime(metadata_runtime.topology)
     try:
         metadata_runtime.__enter__()
         other.__enter__()
@@ -210,7 +210,7 @@ def test_closing_first_runtime_does_not_claim_second_workers_as_leaks(metadata_r
 
 def _collect_incomplete_frame(incoming, result, value):
     connection = Connection(incoming.detach())
-    runtime = object.__new__(SymmetricRuntime)
+    runtime = object.__new__(DistributedRuntime)
     runtime.topology, runtime.commit = value, StepCommit(value.state)
     runtime.connections, runtime.processes = [connection], []
     runtime.timeout_s, runtime.origin = .5, time.monotonic()

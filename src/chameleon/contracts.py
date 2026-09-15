@@ -1,5 +1,7 @@
 """Immutable input contracts; no planning or recovery algorithms live here."""
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -15,6 +17,15 @@ def _finite(name: str, value: float, *, positive: bool = False) -> None:
             or not math.isfinite(value) or value < 0 or (positive and value == 0)):
         bound = "positive" if positive else "nonnegative"
         raise ValueError(f"{name} must be finite and {bound}")
+
+
+def require_exact_fields(value, fields, name: str) -> None:
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError(f"invalid {name} fields")
+
+
+def stable_hash(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

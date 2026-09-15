@@ -2,9 +2,10 @@ from copy import deepcopy
 
 import pytest
 
-from chameleon.decision_center import DecisionCenter, select_policy
+from chameleon.decision_center import DecisionCenter
 from chameleon.plan_cache import PlanCache
 from chameleon.planner import Planner
+from conftest import _select_candidates
 from test_decision_center_oracle import scenario
 
 
@@ -58,9 +59,9 @@ def test_duration_is_not_cached_and_equation8_is_recomputed_for_each_d():
     crossover = dynamic.estimated_transition_time_s / (
         1 - dynamic.estimated_step_time_s / rerouting.estimated_step_time_s
     )
-    short = select_policy(first, crossover * 0.75)
+    short = _select_candidates(first, crossover * 0.75)
     second = center.evaluate_candidates(state, profile)
-    long = select_policy(second, crossover * 2)
+    long = _select_candidates(second, crossover * 2)
 
     assert short.plan.policy == "rerouting"
     assert long.plan.policy == "dynamic"
@@ -75,7 +76,7 @@ def test_post_failure_cache_miss_keeps_search_time_and_can_change_equation8(monk
     original, state, profile = scenario()
     precomputed = _cached_center(original, PlanCache())
     precomputed.precompute_dynamic((state,), profile, max_failures=1)
-    assert select_policy(precomputed.evaluate_candidates(state, profile), 100.).plan.policy == "dynamic"
+    assert precomputed.select(state, profile, 100.).plan.policy == "dynamic"
 
     clock = iter((10., 110.))
     monkeypatch.setattr("chameleon.decision_center.perf_counter", lambda: next(clock))
@@ -85,7 +86,7 @@ def test_post_failure_cache_miss_keeps_search_time_and_can_change_equation8(monk
     assert dynamic.derivation["dynamic_search_cache"]["hit"] is False
     assert dynamic.derivation["unoverlapped_search_time_s"] == 100.
     assert dynamic.transition.unoverlapped_search_time_s == 100.
-    assert select_policy(candidates, 100.).plan.policy == "rerouting"
+    assert _select_candidates(candidates, 100.).plan.policy == "rerouting"
 
 
 def test_state_model_config_and_full_profile_identity_are_cache_keys(monkeypatch):

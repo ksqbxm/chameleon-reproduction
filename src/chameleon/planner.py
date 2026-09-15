@@ -8,9 +8,8 @@ across target slots. No transition estimate is fabricated here.
 from dataclasses import asdict, dataclass, field
 from itertools import accumulate, combinations, product
 
-from .contracts import ClusterState, ModelConfig, WorkerIdentity, _finite, _integer
+from .contracts import ClusterState, ModelConfig, WorkerIdentity, _finite, _integer, stable_hash
 from .estimators import Estimator, MemoryEstimate, TimeEstimate
-from .profiler import _hash
 
 
 def _range_values(name, values):
@@ -149,7 +148,7 @@ class DynamicPlan:
                 raise ValueError("plan micro-batches must match the estimated distribution")
             if self.time.feasible:
                 _finite("estimated step time", self.time.step_time_s, positive=True)
-        object.__setattr__(self, "plan_id", "dynamic-" + _hash({
+        object.__setattr__(self, "plan_id", "dynamic-" + stable_hash({
             "workers": tuple(asdict(w) for w in sorted(self.survivors, key=lambda w: w.worker_id)),
             "generation": self.generation, "global_batch_size": self.global_batch_size,
             "lengths": self.pipeline_lengths, "batch": self.pipeline_micro_batches,
@@ -183,7 +182,7 @@ class NoFeasibleDynamicPlanError(RuntimeError):
 class Planner:
     def __init__(self, estimator: Estimator, *, config: ModelConfig, r_dp, r_pp,
                  memory_capacity_bytes: int):
-        if estimator.profile["identity"]["config_hash"] != _hash(asdict(config)):
+        if estimator.profile["identity"]["config_hash"] != stable_hash(asdict(config)):
             raise ValueError("planner config must match profile config identity")
         if estimator.layer_modules != tuple(f"blocks.{i}" for i in range(config.num_layers)):
             raise ValueError("planner layers must match the configured blocks in model order")
@@ -201,7 +200,7 @@ class Planner:
             raise ValueError("state must preserve the configured global batch size")
         workers = tuple(sorted(state.workers, key=lambda worker: worker.worker_id))
         order = tuple(self.estimator.profile["identity"]["module_order"])
-        profile_hash = _hash(self.estimator.profile)
+        profile_hash = stable_hash(self.estimator.profile)
         for dp in self.r_dp:
             for lengths in integer_partitions(len(workers), dp, self.r_pp):
                 batches = batch_distributions(self.global_micro_batches, lengths)

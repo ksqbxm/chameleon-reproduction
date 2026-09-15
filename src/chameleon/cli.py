@@ -5,12 +5,14 @@ from dataclasses import asdict, is_dataclass
 import json
 from pathlib import Path
 
-from .contracts import ClusterState, FailureEvent, ModelConfig, WorkerIdentity, _finite, _integer
+from .contracts import (ClusterState, FailureEvent, ModelConfig, WorkerIdentity, _finite, _integer,
+                        require_exact_fields, stable_hash)
 from .environment import environment_report
-from .model import build_initial_model
+from .model import build_initial_model, validate_stage_layout
 from .plan_cache import PlanCache
-from .profiler import Profiler, _hash, export_profile, load_profile, profile_identity, train_profile_step
-from .runtime import SymmetricRuntime, SymmetricTopology
+from .profiler import Profiler, export_profile, load_profile, profile_identity, train_profile_step
+from .runtime import DistributedRuntime, SymmetricTopology
+from .state_sources import adamw_inventory
 from .transfer_calibration import run_transfer_calibration
 
 
@@ -28,11 +30,6 @@ def _relative_path(value, name):
     return path
 
 
-def _fields(value, expected, name):
-    if not isinstance(value, dict) or set(value) != set(expected):
-        raise ValueError(f"invalid {name} fields")
-
-
 def _number(name, value, *, positive=False):
     _finite(name, value, positive=positive)
     return value
@@ -42,7 +39,7 @@ def load_config(path: str) -> dict:
     """Load the strict versioned CLI configuration without changing the environment."""
     source = _relative_path(path, "config")
     payload = json.loads(source.read_text(encoding="utf-8"))
-    _fields(payload, CONFIG_FIELDS, "config")
+    require_exact_fields(payload, CONFIG_FIELDS, "config")
     if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
         raise ValueError("unsupported CLI config schema version")
     if payload["device"] not in ("cpu", "cuda"):
@@ -55,13 +52,13 @@ def load_config(path: str) -> dict:
         raise ValueError("config dtype must be float64 or float32")
     payload["artifact_dir"] = str(_relative_path(payload["artifact_dir"], "artifact_dir"))
 
-    _fields(payload["model"], ModelConfig.__dataclass_fields__, "model")
+    require_exact_fields(payload["model"], ModelConfig.__dataclass_fields__, "model")
     model = ModelConfig(**payload["model"])
     if model.paper_path is not None:
         _relative_path(model.paper_path, "paper_path")
 
     parallel = payload["parallel"]
-    _fields(parallel, ("dp_size", "pp_size", "stage_modules", "failure_rank"), "parallel")
+    require_exact_fields(parallel, ("dp_size", "pp_size", "stage_modules", "failure_rank"), "parallel")
     _integer("dp_size", parallel["dp_size"])
     _integer("pp_size", parallel["pp_size"])
     _integer("failure_rank", parallel["failure_rank"], 0)
@@ -72,15 +69,10 @@ def load_config(path: str) -> dict:
     stages = tuple(tuple(stage) for stage in parallel["stage_modules"])
     if len(stages) != parallel["pp_size"]:
         raise ValueError("stage_modules must match pp_size")
-    expected_modules = ("embedding", *(f"blocks.{i}" for i in range(model.num_layers)),
-                        "final_norm", "lm_head")
-    if (any(not stage for stage in stages)
-            or tuple(module for stage in stages for module in stage) != expected_modules):
-        raise ValueError("stage_modules must partition the complete model in order")
-    parallel["stage_modules"] = stages
+    parallel["stage_modules"] = validate_stage_layout(model, stages)
 
     training = payload["training"]
-    _fields(training, ("steps", "resume_steps", "lr", "weight_decay", "timeout_s"), "training")
+    require_exact_fields(training, ("steps", "resume_steps", "lr", "weight_decay", "timeout_s"), "training")
     _integer("training steps", training["steps"])
     _integer("resume_steps", training["resume_steps"])
     _number("lr", training["lr"], positive=True)
@@ -88,7 +80,7 @@ def load_config(path: str) -> dict:
     _number("timeout_s", training["timeout_s"], positive=True)
 
     planner = payload["planner"]
-    _fields(planner, ("r_dp", "r_pp", "memory_capacity_bytes", "max_precompute_failures"), "planner")
+    require_exact_fields(planner, ("r_dp", "r_pp", "memory_capacity_bytes", "max_precompute_failures"), "planner")
     for name in ("r_dp", "r_pp"):
         if not isinstance(planner[name], list) or not planner[name]:
             raise ValueError(f"{name} must be a nonempty list")
@@ -98,8 +90,8 @@ def load_config(path: str) -> dict:
     _integer("max_precompute_failures", planner["max_precompute_failures"])
 
     profiling = payload["profile"]
-    _fields(profiling, ("steps", "ema_alpha", "calibration_warmup", "calibration_iterations",
-                        "calibration_bootstrap_rounds"), "profile")
+    require_exact_fields(profiling, ("steps", "ema_alpha", "calibration_warmup", "calibration_iterations",
+                                     "calibration_bootstrap_rounds"), "profile")
     _integer("profile steps", profiling["steps"])
     _number("ema_alpha", profiling["ema_alpha"], positive=True)
     if profiling["ema_alpha"] > 1:
@@ -129,7 +121,7 @@ def _topology(config):
 
 def _runtime(config):
     training = config["training"]
-    return SymmetricRuntime(
+    return DistributedRuntime(
         _topology(config),
         device=config["device"],
         dtype=config["dtype"],
@@ -208,10 +200,8 @@ def profile_command(config, output):
         start = state.committed_global_step * model_config.global_batch_size
         sample_ids.extend(range(start, start + model_config.global_batch_size))
         state, _ = train_profile_step(model, optimizer, state, profiler=profiler)
-    sizes = {parameter.numel() * parameter.element_size() for parameter in model.parameters()
-             if parameter.requires_grad}
-    for parameter_state in optimizer.state.values():
-        sizes.update(tensor.numel() * tensor.element_size() for tensor in parameter_state.values())
+    sizes = {tensor.nbytes for tensor in adamw_inventory(
+        model, optimizer, committed_global_step=state.committed_global_step)}
     calibration = run_transfer_calibration(
         config["device"],
         2,
@@ -227,7 +217,7 @@ def profile_command(config, output):
     output_path = _relative_path(output, "profile output")
     export_profile(snapshot, str(output_path), expected_identity=profiler.identity)
     report = _base_report("profile", config)
-    report.update(profile_path=output, profile_hash=_hash(snapshot), profile_schema_version=snapshot["schema_version"],
+    report.update(profile_path=output, profile_hash=stable_hash(snapshot), profile_schema_version=snapshot["schema_version"],
                   committed_global_step=state.committed_global_step,
                   sample_ids=sample_ids, global_sample_count=len(sample_ids),
                   profile_steps=[row["step_id"] for row in snapshot["steps"]],
@@ -266,7 +256,7 @@ def _load_matching_profile(config, path):
 
 
 def recover_demo_command(config, profile_path, duration):
-    from .decision_center import DecisionCenter, select_policy
+    from .decision_center import DecisionCenter
 
     _finite("inter_fault_duration_s", duration, positive=True)
     profile, expected_identity = _load_matching_profile(config, profile_path)
@@ -303,8 +293,7 @@ def recover_demo_command(config, profile_path, duration):
         recovery_state = runtime.recovery_state(failure)
         if recovery_state.recovery_id != preview.recovery_id:
             raise RuntimeError("live recovery state differs from the precomputed safe-point scenario")
-        candidates = center.evaluate_candidates(recovery_state, profile)
-        decision = select_policy(candidates, duration)
+        decision = center.select(recovery_state, profile, duration)
         recovery = runtime.recover(failure, decision)
         results.extend(runtime.train_step() for _ in range(config["training"]["resume_steps"]))
     report = _base_report("recover-demo", config)
@@ -328,7 +317,7 @@ def recover_demo_command(config, profile_path, duration):
         selected_policy=decision.plan.policy,
         selected_plan_id=decision.plan.plan_id,
         selected_score=decision.score,
-        profile_hash=_hash(profile),
+        profile_hash=stable_hash(profile),
         precomputed=precomputed,
         precompute_completed_before_kill=True,
         cache=cache.stats,

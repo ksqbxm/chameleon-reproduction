@@ -3,8 +3,9 @@ import math
 
 import pytest
 
-from chameleon import ClusterState, ModelConfig, WorkerIdentity
+from chameleon import ClusterState, ModelConfig, UnrecoverableStateError, WorkerIdentity
 from chameleon.profiler import Measurements, Profiler, tensor_inventory, train_profile_step
+from chameleon.state_sources import adamw_inventory
 
 
 def test_raw_samples_and_ema_match_hand_calculation():
@@ -49,22 +50,22 @@ def training(torch_module, device):
 
 def test_adamw_requires_real_warmup(training):
     model, optimizer, state = training
-    with pytest.raises(ValueError, match="warmed up"):
-        tensor_inventory(model, optimizer)
+    with pytest.raises(ValueError, match="committed_global_step"):
+        tensor_inventory(model, optimizer, committed_global_step=0)
     profiler = Profiler(model, optimizer)
-    with pytest.raises(ValueError, match="warmed up"):
+    with pytest.raises(ValueError, match="committed_global_step"):
         train_profile_step(model, optimizer, state, profiler=profiler)
     assert state.committed_global_step == 0
     assert not profiler.steps
     state, _ = train_profile_step(model, optimizer, state)
     assert state.committed_global_step == 1
-    assert tensor_inventory(model, optimizer)
+    assert tensor_inventory(model, optimizer, committed_global_step=1)
 
 
 def test_inventory_matches_independent_tensors_and_includes_endpoints(training, torch_module):
     model, optimizer, state = training
     train_profile_step(model, optimizer, state)
-    inventory = tensor_inventory(model, optimizer)
+    inventory = tensor_inventory(model, optimizer, committed_global_step=1)
     assert set(inventory) == {"embedding", "blocks.0", "blocks.1", "final_norm", "lm_head"}
     for module_id, row in inventory.items():
         tensors = [p for name, p in model.named_parameters()
@@ -78,14 +79,43 @@ def test_inventory_matches_independent_tensors_and_includes_endpoints(training, 
     # New trainable modules must appear without a hardcoded endpoint allowlist.
     model.extra = torch_module.nn.Linear(4, 4, device=next(model.parameters()).device,
                                         dtype=torch_module.float64)
-    optimizer.add_param_group({"params": list(model.extra.parameters())})
-    for p in model.extra.parameters():
-        p.grad = torch_module.ones_like(p)
+    optimizer = torch_module.optim.AdamW(model.parameters(), lr=.007, amsgrad=False)
+    for p in model.parameters():
+        if p.requires_grad:
+            p.grad = torch_module.ones_like(p)
     optimizer.step()
-    assert "extra" in tensor_inventory(model, optimizer)
+    assert "extra" in tensor_inventory(model, optimizer, committed_global_step=1)
     model.extra.bias.requires_grad_(False)
-    optimizer.param_groups[-1]["params"] = [model.extra.weight]
-    assert tensor_inventory(model, optimizer)["extra"]["parameter_bytes"] == 4 * 4 * 8
+    optimizer.param_groups[0]["params"] = [p for p in model.parameters() if p.requires_grad]
+    assert tensor_inventory(model, optimizer, committed_global_step=1)["extra"]["parameter_bytes"] == 4 * 4 * 8
+
+
+@pytest.mark.parametrize("fault", ("duplicate", "missing", "step", "shape", "dtype", "device"))
+def test_profiler_and_recovery_share_adamw_state_validation(training, torch_module, fault):
+    model, optimizer, state = training
+    state, _ = train_profile_step(model, optimizer, state)
+    parameter = next(parameter for parameter in model.parameters() if parameter.requires_grad)
+    if fault == "duplicate":
+        optimizer.param_groups[0]["params"].append(parameter)
+    elif fault == "missing":
+        del optimizer.state[parameter]["exp_avg"]
+    elif fault == "step":
+        optimizer.state[parameter]["step"].fill_(2)
+    elif fault == "shape":
+        optimizer.state[parameter]["exp_avg"] = torch_module.empty(
+            (1,), dtype=parameter.dtype, device=parameter.device)
+    elif fault == "dtype":
+        dtype = torch_module.float32 if parameter.dtype == torch_module.float64 else torch_module.float64
+        optimizer.state[parameter]["exp_avg"] = torch_module.empty(parameter.shape, dtype=dtype,
+                                                                     device=parameter.device)
+    else:
+        optimizer.state[parameter]["exp_avg"] = torch_module.empty(parameter.shape, dtype=parameter.dtype,
+                                                                     device="meta")
+    with pytest.raises((ValueError, UnrecoverableStateError)) as recovery_error:
+        adamw_inventory(model, optimizer, committed_global_step=state.committed_global_step)
+    with pytest.raises(type(recovery_error.value), match="AdamW|optimizer") as profiler_error:
+        tensor_inventory(model, optimizer, committed_global_step=state.committed_global_step)
+    assert str(profiler_error.value) == str(recovery_error.value)
 
 
 def test_live_timing_trace_and_output_activation_bytes(training, device, torch_module):

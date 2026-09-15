@@ -4,11 +4,10 @@ from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 
-from .contracts import UnrecoverableStateError
+from .contracts import UnrecoverableStateError, stable_hash
 from .restorer import MigrationManifest, migration_cost_matrix, synchronization_rounds
 from .hungarian import hungarian
 from .state_sources import ADAMW_FIELDS, adamw_inventory
-from .profiler import _hash
 
 
 def validate_manifest(manifest, sources):
@@ -66,7 +65,7 @@ def validate_manifest(manifest, sources):
             or set(manifest.release_after_ack) != held - targets
             or len(manifest.release_after_ack) != len(held - targets)):
         raise ValueError("manifest source lifetime differs from live state")
-    identity = "migration-" + _hash({"plan_id": plan.plan_id, "committed_global_step": state.committed_global_step,
+    identity = "migration-" + stable_hash({"plan_id": plan.plan_id, "committed_global_step": state.committed_global_step,
                                      "actions": tuple(asdict(a) for a in manifest.actions)})
     owners = {module: tuple(w.worker_id for slot, w in assignments if module in slot.modules)
               for module in model_order}

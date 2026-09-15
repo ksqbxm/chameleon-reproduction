@@ -4,8 +4,9 @@ import json
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import DynamicTopology, RuntimeErrorWithAudit, SymmetricRuntime
-from test_symmetric_training import assert_numerical_step, assert_p2p_warmup, assert_trace_dependencies
+from chameleon.runtime import DistributedRuntime, DynamicTopology, RuntimeErrorWithAudit
+from conftest import assert_numerical_step
+from test_symmetric_training import assert_p2p_warmup, assert_trace_dependencies
 
 
 def test_every_gradient_parameter_and_adamw_matches_three_fp64_steps(asymmetric_training):
@@ -117,7 +118,7 @@ def test_fp32_or_failure_cleans_nonuniform_topology(distributed_environment, dev
     long = (("embedding",), ("blocks.0",), ("blocks.1", "final_norm", "lm_head"))
     topology = DynamicTopology(ClusterState(tuple(WorkerIdentity(f"smoke-{r}", r, 0) for r in range(size)), 19),
                                config, (short, long if device == "cuda" else short, long), (5, 3, 2))
-    runtime = SymmetricRuntime(topology, device=device, capture_state=case == "fp32", dtype="float32",
+    runtime = DistributedRuntime(topology, device=device, capture_state=case == "fp32", dtype="float32",
                                behavior=case if case != "fp32" else "normal")
     if case == "fp32":
         with runtime:

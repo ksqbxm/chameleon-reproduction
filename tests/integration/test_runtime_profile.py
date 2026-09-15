@@ -101,14 +101,14 @@ def test_local_module_measurements_feed_estimator_including_endpoints(symmetric_
 def test_default_runtime_retains_metadata_without_training_tensor_backup(distributed_environment, device, world_size):
     import torch
     from chameleon import ClusterState, ModelConfig, WorkerIdentity
-    from chameleon.runtime import SymmetricRuntime, SymmetricTopology
+    from chameleon.runtime import DistributedRuntime, SymmetricTopology
 
     assert world_size == 4, "Task09 acceptance requires --world-size 4"
     config = ModelConfig(vocab_size=7, hidden_size=4, num_layers=2, num_heads=1,
                          sequence_length=3, global_batch_size=4, micro_batch_size=1)
     topology = SymmetricTopology(ClusterState(tuple(WorkerIdentity(f"metadata-{rank}", rank, 0) for rank in range(4)), 4),
                                  config, (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head")))
-    runtime = SymmetricRuntime(topology, device=device)
+    runtime = DistributedRuntime(topology, device=device)
     with runtime:
         first, second = runtime.train_step(), runtime.train_step()
         assert "snapshots" not in first and "snapshots" not in second

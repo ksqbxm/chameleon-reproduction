@@ -14,14 +14,16 @@ import tempfile
 import time
 import traceback
 
-from .contracts import ClusterState, FailureEvent, ModelConfig, UnrecoverableStateError, WorkerIdentity, _finite, _integer
+from .contracts import (ClusterState, FailureEvent, ModelConfig, UnrecoverableStateError,
+                        WorkerIdentity, _finite, _integer, stable_hash)
 from .data import next_sample_ids
 from .environment import validate_device
 from .global_loss import GlobalBatchAccounting
 from .schedule import build_1f1b_schedule
 from .step import StepCommit
-from .restorer import synchronization_rounds
-from .profiler import _hash
+from .restorer import TargetSlot, synchronization_rounds
+from .process_control import (ProcessAuditError, child_process_leaks, close_processes,
+                              terminate_processes, wait_processes, write_json_atomic)
 
 
 class _Topology:
@@ -72,6 +74,12 @@ class _Topology:
         start = sum(self.pipeline_micro_batches[:pipeline])
         return batches[start:start + self.pipeline_micro_batches[pipeline]]
 
+    def _validate_layouts(self, layouts):
+        from .model import validate_stage_layout
+
+        for layout in layouts:
+            validate_stage_layout(self.config, layout)
+
 
 @dataclass(frozen=True)
 class SymmetricTopology(_Topology):
@@ -80,12 +88,7 @@ class SymmetricTopology(_Topology):
     stage_modules: tuple[tuple[str, ...], ...]
 
     def __post_init__(self):
-        expected = ("embedding", *(f"blocks.{i}" for i in range(self.config.num_layers)),
-                    "final_norm", "lm_head")
-        if (not isinstance(self.stage_modules, tuple) or not self.stage_modules
-                or any(not isinstance(stage, tuple) or not stage for stage in self.stage_modules)
-                or tuple(name for stage in self.stage_modules for name in stage) != expected):
-            raise ValueError("stages must partition every model module once in model order")
+        self._validate_layouts((self.stage_modules,))
         self._validate_state()
         if len(self.state.workers) % self.pp_size:
             raise ValueError("symmetric workers must fill every DP/PP stage")
@@ -127,13 +130,9 @@ class DynamicTopology(_Topology):
     pipeline_ranks: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self):
-        expected = ("embedding", *(f"blocks.{i}" for i in range(self.config.num_layers)),
-                    "final_norm", "lm_head")
-        if (not isinstance(self.layouts, tuple) or not self.layouts
-                or any(not isinstance(layout, tuple) or not layout
-                       or any(not isinstance(stage, tuple) or not stage for stage in layout)
-                       or tuple(name for stage in layout for name in stage) != expected for layout in self.layouts)):
-            raise ValueError("each pipeline must partition every model module once in model order")
+        if not isinstance(self.layouts, tuple) or not self.layouts:
+            raise ValueError("layouts must be a nonempty tuple")
+        self._validate_layouts(self.layouts)
         self._validate_state()
         if not isinstance(self.pipeline_micro_batches, tuple):
             raise ValueError("pipeline micro-batch counts must be a tuple")
@@ -167,22 +166,35 @@ class DynamicTopology(_Topology):
         return tuple(map(len, self.layouts))
 
     @classmethod
-    def from_plan(cls, plan, config, *, assignments=None):
+    def from_plan(cls, plan, config, *, state: ClusterState, assignments):
         if not plan.feasible:
             raise ValueError("runtime requires a feasible dynamic plan")
-        if plan.time.derivation["profile_identity"]["config_hash"] != _hash(asdict(config)):
+        if plan.time.derivation["profile_identity"]["config_hash"] != stable_hash(asdict(config)):
             raise ValueError("runtime config must match the dynamic plan profile")
-        ranks = ()
-        if assignments is not None:
-            slots = {(slot.pipeline, slot.stage): (slot, worker) for slot, worker in assignments}
-            expected = {(p, s) for p, layout in enumerate(plan.layouts) for s in range(len(layout))}
-            if (len(slots) != len(assignments) or set(slots) != expected
-                    or any(slot.modules != plan.layouts[p][s] or worker not in plan.survivors
-                           for (p, s), (slot, worker) in slots.items())):
-                raise ValueError("assignments must match dynamic plan slots and survivor identities")
-            ranks = tuple(tuple(slots[p, s][1].rank for s in range(length)) for p, length in enumerate(plan.pipeline_lengths))
-        return cls(ClusterState(plan.survivors, plan.global_batch_size, plan.generation), config,
-                   plan.layouts, plan.pipeline_micro_batches, ranks)
+        if (not isinstance(state, ClusterState) or state.global_batch_size != plan.global_batch_size
+                or state.generation not in (plan.generation, plan.generation + 1)):
+            raise ValueError("target state must match the dynamic plan batch and generation")
+        target_workers = {worker.worker_id: worker for worker in state.workers}
+        if set(target_workers) != {worker.worker_id for worker in plan.survivors}:
+            raise ValueError("target state must contain exactly the dynamic plan survivors")
+        if (not isinstance(assignments, tuple)
+                or any(not isinstance(assignment, tuple) or len(assignment) != 2
+                       or not isinstance(assignment[0], TargetSlot)
+                       or not isinstance(assignment[1], WorkerIdentity)
+                       for assignment in assignments)):
+            raise ValueError("assignments must be an immutable tuple of slot/worker pairs")
+        slots = {(slot.pipeline, slot.stage): (slot, worker) for slot, worker in assignments}
+        assigned_workers = tuple(worker for _, worker in assignments)
+        expected = {(p, s) for p, layout in enumerate(plan.layouts) for s in range(len(layout))}
+        if (len(slots) != len(assignments) or set(slots) != expected
+                or len(set(assigned_workers)) != len(assigned_workers)
+                or set(assigned_workers) != set(plan.survivors)
+                or any(slot.modules != plan.layouts[p][s] or worker not in plan.survivors
+                       for (p, s), (slot, worker) in slots.items())):
+            raise ValueError("assignments must match dynamic plan slots and survivor identities")
+        ranks = tuple(tuple(target_workers[slots[p, s][1].worker_id].rank for s in range(length))
+                      for p, length in enumerate(plan.pipeline_lengths))
+        return cls(state, config, plan.layouts, plan.pipeline_micro_batches, ranks)
 
 
 @dataclass(frozen=True)
@@ -195,12 +207,7 @@ class ReroutingTopology(_Topology):
     pipeline_ranks: tuple[tuple[int | None, ...], ...]
 
     def __post_init__(self):
-        expected = ("embedding", *(f"blocks.{i}" for i in range(self.config.num_layers)),
-                    "final_norm", "lm_head")
-        if (not isinstance(self.stage_modules, tuple) or not self.stage_modules
-                or any(not isinstance(stage, tuple) or not stage for stage in self.stage_modules)
-                or tuple(name for stage in self.stage_modules for name in stage) != expected):
-            raise ValueError("stages must partition every model module once in model order")
+        self._validate_layouts((self.stage_modules,))
         self._validate_state()
         if (not isinstance(self.pipeline_ranks, tuple) or not self.pipeline_ranks
                 or any(not isinstance(row, tuple) or len(row) != self.pp_size for row in self.pipeline_ranks)):
@@ -264,19 +271,14 @@ class ReroutingTopology(_Topology):
                              for s in range(self.pp_size - 1) for mb in range(count)}))
 
 
-class RuntimeErrorWithAudit(RuntimeError):
-    def __init__(self, message, audit):
-        super().__init__(message)
-        self.audit = audit
+class RuntimeErrorWithAudit(ProcessAuditError):
+    pass
 
 
 def _write_reply(connection, directory, rank, kind, worker, **values):
     """Publish a complete metadata file before sending a fixed-size control token."""
     path = Path(directory) / f"rank-{rank}-{kind}.json"
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(dict(kind=kind, worker=asdict(worker), **values),
-                                    allow_nan=False), encoding="utf-8")
-    temporary.replace(path)
+    write_json_atomic(path, dict(kind=kind, worker=asdict(worker), **values))
     connection.send_bytes(kind.encode("ascii"))
 
 
@@ -743,7 +745,7 @@ def compare_runtime_profile(reports, topology):
             "boundary": "measured operation scopes estimate computation; full step includes P2P, SUM, AdamW and profiling"}
 
 
-class SymmetricRuntime:
+class DistributedRuntime:
     """Controller holds identities and metadata, with no initial model backup."""
 
     def __init__(self, topology: SymmetricTopology | DynamicTopology | ReroutingTopology, *, device="cpu", dtype="float64",
@@ -773,6 +775,7 @@ class SymmetricRuntime:
         self._required = None
         self._directory = None
         self._closed = False
+        self._child_baseline = set()
 
     @property
     def state(self):
@@ -828,6 +831,7 @@ class SymmetricRuntime:
     def __enter__(self):
         if self._closed or self._directory is not None:
             raise RuntimeError("runtime can only be opened once")
+        self._child_baseline = {process.pid for process in mp.active_children()}
         self.origin = time.monotonic()
         with self._abort_on_error():
             self.root.mkdir(parents=True, exist_ok=True)
@@ -1032,14 +1036,11 @@ class SymmetricRuntime:
             manifest = execution if isinstance(execution, MigrationManifest) else None
             if manifest is not None:
                 if (manifest.plan.time.derivation["profile_identity"]["config_hash"]
-                        != _hash(asdict(self.topology.config))):
+                        != stable_hash(asdict(self.topology.config))):
                     raise ValueError("dynamic recovery model config must match the plan profile")
                 validate_manifest(manifest, sources)
-                locations = {(slot.pipeline, slot.stage): dense[w.worker_id] for slot, w in manifest.assignments}
-                pipeline_ranks = tuple(tuple(locations[p, s] for s in range(length))
-                                       for p, length in enumerate(manifest.plan.pipeline_lengths))
-                target = DynamicTopology(new_state, self.topology.config, manifest.plan.layouts,
-                                         manifest.plan.pipeline_micro_batches, pipeline_ranks)
+                target = DynamicTopology.from_plan(manifest.plan, self.topology.config,
+                                                   state=new_state, assignments=manifest.assignments)
             elif isinstance(execution, ReroutingPlan):
                 if execution.state != recovery:
                     raise ValueError("rerouting decision differs from live failure/state inventory")
@@ -1151,33 +1152,20 @@ class SymmetricRuntime:
                     except (OSError, EOFError):
                         pass
                 deadline = time.monotonic() + min(self.timeout_s, 10)
-                for process in self.processes:
-                    process.join(max(0, deadline - time.monotonic()))
-                if any(process.is_alive() or process.exitcode != 0 for process in self.processes):
-                    error = "runtime shutdown failed or exceeded hard timeout"
+                try:
+                    wait_processes(self.processes, deadline, "runtime shutdown")
+                except (RuntimeError, TimeoutError) as exc:
+                    error = str(exc)
                     close_failed = True
         finally:
-            for process in self.processes:
-                if process.is_alive():
-                    process.terminate()
-            deadline = time.monotonic() + 5
-            for process in self.processes:
-                process.join(max(0, deadline - time.monotonic()))
-            for process in self.processes:
-                if process.is_alive():
-                    process.kill()
-            deadline = time.monotonic() + 5
-            for process in self.processes:
-                process.join(max(0, deadline - time.monotonic()))
-            workers = [{"pid": p.pid, "exitcode": p.exitcode, "alive": p.is_alive()}
-                       for p in self.processes + self._retired]
+            workers = terminate_processes(self.processes + self._retired)
             for connection in self.connections:
                 connection.close()
-            for process in self.processes + self._retired:
-                if not process.is_alive():
-                    process.close()
+            close_processes(self.processes + self._retired)
             self._directory.cleanup()
-        leaked = sorted(worker["pid"] for worker in workers if worker["alive"])
+        owned_pids = {worker["pid"] for worker in workers}
+        leaked = sorted(set(child_process_leaks(self._child_baseline, owned_pids=owned_pids))
+                        | {worker["pid"] for worker in workers if worker["alive"]})
         self.audit = {"workers": workers, "leaked_pids": leaked,
                       "rendezvous_backend": "FileStore", "rendezvous_port": None,
                       "rendezvous_file": str(self.rendezvous_file),

@@ -3,8 +3,8 @@
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 
+from .contracts import stable_hash
 from .planner import DynamicPlan, NoFeasibleDynamicPlanError, Planner
-from .profiler import _hash
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ class PlanCache:
         """Bind topology/failure, model/config, full profile and search limits; omit D."""
         failure = asdict(recovery_state.failure)
         failure["failed_worker_ids"] = tuple(sorted(failure["failed_worker_ids"]))
-        return _hash({
+        return stable_hash({
             "schema_version": 1,
             "state": {
                 "recovery_id": recovery_state.recovery_id,
@@ -61,7 +61,7 @@ class PlanCache:
             "model_identity": planner.estimator.profile["identity"]["model_hash"],
             "config_identity": planner.estimator.profile["identity"]["config_hash"],
             "config": asdict(planner.config),
-            "profile_hash": _hash(planner.estimator.profile),
+            "profile_hash": stable_hash(planner.estimator.profile),
             "search": {
                 "Rdp": planner.r_dp,
                 "Rpp": planner.r_pp,

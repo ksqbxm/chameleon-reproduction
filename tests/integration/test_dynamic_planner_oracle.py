@@ -1,5 +1,4 @@
 from dataclasses import asdict, replace
-import hashlib
 import heapq
 import inspect
 from itertools import product
@@ -7,7 +6,7 @@ import json
 
 import pytest
 
-from chameleon.contracts import ClusterState, ModelConfig, WorkerIdentity
+from chameleon.contracts import ClusterState, ModelConfig, WorkerIdentity, stable_hash
 from chameleon.estimators import Estimator
 from chameleon.planner import NoFeasibleDynamicPlanError, Planner
 
@@ -41,7 +40,7 @@ def controlled_profile(num_layers, global_nm):
         metrics[field] = {"samples": [now + 1.], "ema": now + 1.}
     profile = {"schema_version": 3, "ema_alpha": .5,
                "identity": {"model_hash": "a" * 64,
-                            "config_hash": hashlib.sha256(json.dumps(asdict(config), sort_keys=True).encode()).hexdigest(),
+                            "config_hash": stable_hash(asdict(config)),
                             "module_parameter_bytes": {name: spec[0] for name, spec in specs.items()},
                             "module_order": list(specs),
                             "device": {"type": "cpu", "index": None, "torch": "fixture",

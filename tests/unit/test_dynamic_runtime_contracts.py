@@ -3,10 +3,11 @@ from dataclasses import asdict, replace
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import DynamicTopology, SymmetricRuntime, compare_runtime_profile
+from chameleon.contracts import stable_hash
+from chameleon.runtime import DistributedRuntime, DynamicTopology, compare_runtime_profile
 from chameleon.estimators import TimeEstimate
 from chameleon.planner import DynamicPlan
-from chameleon.profiler import _hash, _validate_parallel, _validate_trace
+from chameleon.profiler import _validate_parallel, _validate_trace
 from chameleon.restorer import TargetSlot
 
 
@@ -69,7 +70,7 @@ def test_initial_runtime_rejects_reinitializing_committed_dynamic_state():
     current = topology()
     recovered = replace(current, state=replace(current.state, committed_global_step=3))
     with pytest.raises(ValueError, match="already committed"):
-        SymmetricRuntime(recovered)
+        DistributedRuntime(recovered)
 
 
 def test_each_pipeline_requires_complete_ordered_model_including_endpoints():
@@ -110,7 +111,7 @@ def plan_for(current):
     time = TimeEstimate(1., dict(layouts=current.layouts, profile_hash="controlled",
                                 pipeline_micro_batches=current.pipeline_micro_batches,
                                 global_micro_batches=current.global_micro_batches,
-                                profile_identity=dict(config_hash=_hash(asdict(current.config)))))
+                                profile_identity=dict(config_hash=stable_hash(asdict(current.config)))))
     return DynamicPlan(current.config.global_batch_size, current.state.generation, current.ranks,
                        "controlled", current.pipeline_lengths, current.pipeline_micro_batches,
                        current.layouts, time, ())
@@ -123,23 +124,49 @@ def test_feasible_plan_and_restorer_assignments_define_actual_worker_locations()
                         for (p, s, stage), worker in zip(
                             ((p, s, stage) for p, layout in enumerate(current.layouts) for s, stage in enumerate(layout)),
                             reversed(current.ranks)))
-    actual = DynamicTopology.from_plan(plan, current.config, assignments=assignments)
+    actual = DynamicTopology.from_plan(plan, current.config, state=current.state,
+                                       assignments=assignments)
     assert actual.pipeline_ranks == ((6, 5), (4, 3), (2, 1, 0))
     assert actual.layouts == plan.layouts
     assert actual.pipeline_micro_batches == (5, 3, 2)
     assert actual.state.committed_global_step == 0
-    assert DynamicTopology.from_plan(plan, current.config).pipeline_ranks == current.pipeline_ranks
+    natural = tuple((TargetSlot(p, s, stage), current.ranks[index])
+                    for index, (p, s, stage) in enumerate(
+                        ((p, s, stage) for p, layout in enumerate(current.layouts)
+                         for s, stage in enumerate(layout))))
+    assert DynamicTopology.from_plan(plan, current.config, state=current.state,
+                                     assignments=natural).pipeline_ranks == current.pipeline_ranks
+    with pytest.raises(TypeError):
+        DynamicTopology.from_plan(plan, current.config, state=current.state)
     invalid = assignments[:-1]
     for invalid in (invalid, (*assignments, assignments[0]),
                     ((replace(assignments[0][0], modules=("lm_head",)), assignments[0][1]), *assignments[1:]),
                     ((assignments[0][0], replace(assignments[0][1], generation=3)), *assignments[1:]),
                     ((assignments[0][0], assignments[1][1]), *assignments[1:])):
         with pytest.raises(ValueError):
-            DynamicTopology.from_plan(plan, current.config, assignments=invalid)
+            DynamicTopology.from_plan(plan, current.config, state=current.state,
+                                      assignments=invalid)
     with pytest.raises(ValueError, match="feasible"):
-        DynamicTopology.from_plan(replace(plan, time=None), current.config)
+        DynamicTopology.from_plan(replace(plan, time=None), current.config,
+                                  state=current.state, assignments=natural)
     with pytest.raises(ValueError, match="config"):
-        DynamicTopology.from_plan(plan, replace(current.config, seed=43))
+        DynamicTopology.from_plan(plan, replace(current.config, seed=43),
+                                  state=current.state, assignments=natural)
+    wrong_worker = replace(current.state.workers[0], worker_id="other")
+    with pytest.raises(ValueError, match="survivors"):
+        DynamicTopology.from_plan(plan, current.config,
+                                  state=replace(current.state, workers=(wrong_worker, *current.state.workers[1:])),
+                                  assignments=natural)
+    sparse_worker = replace(current.state.workers[0], rank=len(current.state.workers) + 1)
+    with pytest.raises(ValueError, match="dense ranks"):
+        DynamicTopology.from_plan(plan, current.config,
+                                  state=replace(current.state, workers=(sparse_worker, *current.state.workers[1:])),
+                                  assignments=natural)
+    future_workers = tuple(replace(worker, generation=4) for worker in current.state.workers)
+    with pytest.raises(ValueError, match="generation"):
+        DynamicTopology.from_plan(plan, current.config,
+                                  state=replace(current.state, workers=future_workers, generation=4),
+                                  assignments=natural)
 
 
 @pytest.mark.parametrize("lengths", [[], [2, 3], [2, 0, 3], [2, True, 3], [2, 2, 2], (2, 2, 3)])

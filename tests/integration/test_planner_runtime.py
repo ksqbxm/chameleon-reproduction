@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from chameleon.estimators import Estimator
 from chameleon.planner import Planner, repair_zero_partitions
 from chameleon.profiler import Profiler, export_profile, load_profile, train_profile_step
 from chameleon.restorer import Restorer
-from chameleon.runtime import DynamicTopology, SymmetricRuntime
+from chameleon.runtime import DistributedRuntime, DynamicTopology
 from chameleon.state_sources import WorkerInventory, adamw_inventory, build_state_source_map
 
 
@@ -47,11 +47,13 @@ def planned_training(request, distributed_environment, device, world_size):
                         for i, worker in enumerate(workers))
     sources = build_state_source_map(state, required, inventories)
     manifest = Restorer(profile, expected_identity=profile["identity"]).plan(plan, sources)
-    topology = DynamicTopology.from_plan(plan, config, assignments=manifest.assignments)
+    topology = DynamicTopology.from_plan(plan, config,
+                                         state=replace(state, committed_global_step=0),
+                                         assignments=manifest.assignments)
     assert topology.synchronization_rounds == manifest.synchronization_rounds
     assert topology.state.committed_global_step == 0  # New topology; Task12 restores old state.
     del profiler, model, optimizer
-    runtime = SymmetricRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
+    runtime = DistributedRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
     with runtime:
         steps = [runtime.train_step() for _ in range(3)]
         profiles = runtime.snapshot_profiles()

@@ -7,33 +7,22 @@ import json
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.contracts import FailureEvent
-from chameleon.decision_center import DecisionCenter, select_policy
-from chameleon.profiler import _hash
+from chameleon.contracts import stable_hash
+from chameleon.decision_center import DecisionCenter
 from chameleon.restorer import MigrationManifest
-from chameleon.runtime import DynamicTopology, ReroutingTopology, SymmetricRuntime, SymmetricTopology
-
-
-def _kill_slot(runtime, pipeline, stage):
-    rank = runtime.topology.pipeline_ranks[pipeline][stage]
-    assert rank is not None
-    worker, process = runtime.topology.ranks[rank], runtime.processes[rank]
-    process.kill()
-    process.join(10)
-    assert not process.is_alive() and process.exitcode not in (None, 0)
-    return (FailureEvent((worker.worker_id,), runtime.state.generation,
-                         runtime.state.committed_global_step),
-            dict(worker_id=worker.worker_id, pid=process.pid, exitcode=process.exitcode))
+from chameleon.runtime import DistributedRuntime, DynamicTopology, ReroutingTopology, SymmetricTopology
+from conftest import _kill_workers, _logged_hashes, _reply_hashes, assert_numerical_step
 
 
 def _choose(candidates, policy):
+    from conftest import _select_candidates
     rerouting, dynamic = candidates
     assert rerouting.feasible and dynamic.feasible
     assert dynamic.estimated_step_time_s < rerouting.estimated_step_time_s
     transition = dynamic.estimated_transition_time_s
     crossover = transition / (1 - dynamic.estimated_step_time_s / rerouting.estimated_step_time_s)
     duration = ((transition + crossover) / 2 if policy == "rerouting" else crossover * 2)
-    decision = select_policy(candidates, duration)
+    decision = _select_candidates(candidates, duration)
     assert decision.plan.policy == policy
     return decision, duration, crossover
 
@@ -47,18 +36,6 @@ def _owner_counts(topology):
     return {module: len(owners) for module, owners in topology.module_owners.items()}
 
 
-def _reply_hashes(replies):
-    return {row["worker"].worker_id: {tuple(item["key"]): item["digest"]
-                                      for item in row["hashes"]}
-            for row in replies}
-
-
-def _logged_hashes(rows):
-    return {row["worker"]["worker_id"]: {tuple(item["key"]): item["digest"]
-                                          for item in row["hashes"]}
-            for row in rows}
-
-
 def _expected_sources(recovery_state, replies):
     survivor_ids = {worker.worker_id for worker in recovery_state.survivor_state.workers}
     hashes = {worker_id: rows for worker_id, rows in _reply_hashes(replies).items()
@@ -69,31 +46,6 @@ def _expected_sources(recovery_state, replies):
     return {module: tuple(sorted(worker_id for worker_id, rows in hashes.items()
                                  if keys <= rows.keys()))
             for module, keys in required.items()}
-
-
-def _assert_numerical_step(actual, expected, device, module_owner_counts):
-    import torch
-
-    tolerance = dict(rtol=1e-7, atol=1e-9) if device == "cuda" else dict(rtol=1e-8, atol=1e-10)
-    assert actual["sample_ids"] == list(expected.sample_ids)
-    assert actual["global_sample_count"] == expected.global_sample_count
-    assert actual["step_id"] == expected.committed_global_step
-    assert actual["loss_global_sum"] == pytest.approx(expected.loss_global_sum,
-                                                     rel=tolerance["rtol"], abs=tolerance["atol"])
-    owners = Counter()
-    for report, snapshot in zip(actual["reports"], actual["snapshots"]):
-        assert set(report["synchronized_parameters"]) == snapshot["parameters"].keys()
-        for name, parameter in snapshot["parameters"].items():
-            owners[name] += 1
-            torch.testing.assert_close(parameter, expected.parameters[name], **tolerance)
-            torch.testing.assert_close(snapshot["gradients"][name], expected.gradients[name], **tolerance)
-            state = snapshot["optimizer_state"][name]
-            assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
-            for field, value in state.items():
-                torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance)
-    expected_owners = Counter({name: module_owner_counts[_module_id(name)]
-                               for name in expected.parameters})
-    assert owners == expected_owners
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +73,7 @@ def consecutive_kill_run(request):
                     for rank in range(expected_size))
     topology = SymmetricTopology(ClusterState(workers, 23, generation=14), config, stages)
     base_profile = _adaptive_base_profile(config, device)
-    runtime = SymmetricRuntime(topology, device=device, capture_state=True,
+    runtime = DistributedRuntime(topology, device=device, capture_state=True,
                                lr=.007, weight_decay=.125)
     with patch("chameleon.runtime._runtime_worker", _guarded_recovery_worker), runtime:
         initial_ready = list(runtime.ready)
@@ -129,7 +81,10 @@ def consecutive_kill_run(request):
         owner_counts = [_owner_counts(runtime.topology)] * 3
         first_before = runtime.inspect_state()
 
-        first_failure, first_kill = _kill_slot(runtime, 0, 1)
+        first_rank = runtime.topology.pipeline_ranks[0][1]
+        assert first_rank is not None
+        first_failure, first_kills = _kill_workers(runtime, (first_rank,))
+        first_kill = first_kills[0]
         first_state = runtime.recovery_state(first_failure)
         first_profile = _controlled_adaptive_profile(
             base_profile, first_state.required, revision=first_state.cluster.generation)
@@ -148,7 +103,10 @@ def consecutive_kill_run(request):
             owner_counts.append(_owner_counts(runtime.topology))
         second_before = runtime.inspect_state()
 
-        second_failure, second_kill = _kill_slot(runtime, 1, 0)
+        second_rank = runtime.topology.pipeline_ranks[1][0]
+        assert second_rank is not None
+        second_failure, second_kills = _kill_workers(runtime, (second_rank,))
+        second_kill = second_kills[0]
         generation_before_stale_rejection = runtime.state.generation
         with pytest.raises(ValueError, match="decision differs from the failed topology"):
             runtime.recover(second_failure, first_decision)
@@ -199,7 +157,7 @@ def test_each_failure_replans_from_fresh_generation_profile_and_sources(consecut
     assert len(first["state"].survivor_state.workers) == initial_size - 1
     assert len(second["state"].survivor_state.workers) == initial_size - 2
     assert first["state"].recovery_id != second["state"].recovery_id
-    assert _hash(first["profile"]) != _hash(second["profile"])
+    assert stable_hash(first["profile"]) != stable_hash(second["profile"])
     assert {candidate.generation for candidate in first["candidates"]} == {14}
     assert {candidate.generation for candidate in second["candidates"]} == {15}
     assert {candidate.plan_id for candidate in first["candidates"]}.isdisjoint(
@@ -280,7 +238,9 @@ def test_consecutive_recovery_matches_uninterrupted_reference(consecutive_kill_r
     for actual, expected, owners in zip(consecutive_kill_run["steps"],
                                         consecutive_kill_run["reference"],
                                         consecutive_kill_run["owner_counts"]):
-        _assert_numerical_step(actual, expected, consecutive_kill_run["device"], owners)
+        expected_owners = {name: owners[_module_id(name)] for name in expected.parameters}
+        assert_numerical_step(actual, expected, consecutive_kill_run["device"],
+                              owner_counts=expected_owners)
     runtime = consecutive_kill_run["runtime"]
     assert runtime.state.committed_global_step == 7
     assert [step["step_id"] for step in consecutive_kill_run["steps"]] == list(range(1, 8))

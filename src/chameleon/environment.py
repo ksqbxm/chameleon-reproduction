@@ -7,12 +7,15 @@ import os
 from pathlib import Path
 import platform
 import re
-import socket
 import sys
 import tempfile
 import time
 import traceback
 from datetime import timedelta
+
+from .process_control import (ProcessAuditError, audit_tcp_ports, child_process_leaks,
+                              close_processes, reserve_tcp_ports, terminate_processes,
+                              wait_processes, write_json_atomic)
 
 
 EXPECTED_PACKAGES = {
@@ -104,17 +107,8 @@ def validate_container(report: dict) -> None:
         raise RuntimeError("Container contract mismatch:\n" + "\n".join(errors))
 
 
-class SmokeError(RuntimeError):
-    def __init__(self, message: str, audit: dict):
-        super().__init__(message)
-        self.audit = audit
-
-
-def _write_record(directory, rank, record):
-    path = Path(directory, f"rank-{rank}.json")
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(record), encoding="utf-8")
-    temporary.replace(path)
+class SmokeError(ProcessAuditError):
+    pass
 
 
 def _worker(rank, world_size, device, backend, port, timeout_s, output_dir, behavior):
@@ -126,7 +120,7 @@ def _worker(rank, world_size, device, backend, port, timeout_s, output_dir, beha
     try:
         if behavior == "hang" and rank == 0:
             record["status"] = "injected hang"
-            _write_record(output_dir, rank, record)
+            write_json_atomic(Path(output_dir, f"rank-{rank}.json"), record)
             time.sleep(3600)
         if behavior == "error" and rank == 0:
             raise RuntimeError("injected worker failure")
@@ -149,7 +143,7 @@ def _worker(rank, world_size, device, backend, port, timeout_s, output_dir, beha
             if dist.is_initialized():
                 dist.destroy_process_group()
         finally:
-            _write_record(output_dir, rank, record)
+            write_json_atomic(Path(output_dir, f"rank-{rank}.json"), record)
 
 
 def run_spawn_smoke(device: str, world_size: int, *, timeout_s: float = 60,
@@ -166,10 +160,7 @@ def run_spawn_smoke(device: str, world_size: int, *, timeout_s: float = 60,
     backend = validate_device(device, world_size)
     root = Path(artifact_dir)
     root.mkdir(parents=True, exist_ok=True)
-    # Hold an ephemeral port until immediately before launching the workers.
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
+    port = reserve_tcp_ports(1)[0]
     baseline = {p.pid for p in mp.active_children()}
     processes = []
     records = []
@@ -187,51 +178,17 @@ def run_spawn_smoke(device: str, world_size: int, *, timeout_s: float = 60,
                 )
                 process.start()
                 processes.append(process)
-            while any(p.is_alive() for p in processes):
-                if any(p.exitcode not in (None, 0) for p in processes):
-                    raise RuntimeError("spawn worker exited abnormally")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"spawn smoke exceeded hard timeout {timeout_s}s")
-                time.sleep(0.02)
-            if any(p.exitcode != 0 for p in processes):
-                raise RuntimeError("spawn worker exited abnormally")
+            wait_processes(processes, deadline, "spawn smoke")
         except BaseException as exc:
             error = exc
         finally:
-            # Terminate all workers before joining; a stuck communicator cannot block cleanup.
-            for p in processes:
-                if p.is_alive():
-                    p.terminate()
-            cleanup_deadline = time.monotonic() + 5
-            for p in processes:
-                p.join(max(0, cleanup_deadline - time.monotonic()))
-            for p in processes:
-                if p.is_alive():
-                    p.kill()
-            kill_deadline = time.monotonic() + 5
-            for p in processes:
-                p.join(max(0, kill_deadline - time.monotonic()))
-            audit["workers"] = [{"pid": p.pid, "exitcode": p.exitcode, "alive": p.is_alive()}
-                                for p in processes]
-            audit["leaked_pids"] = sorted({p.pid for p in mp.active_children()} - baseline)
+            audit["workers"] = terminate_processes(processes)
+            audit["leaked_pids"] = child_process_leaks(baseline)
             for path in sorted(Path(directory).glob("rank-*.json")):
                 records.append(json.loads(path.read_text(encoding="utf-8")))
-            for p in processes:
-                if not p.is_alive():
-                    p.close()
+            close_processes(processes)
     audit["rendezvous_removed"] = not Path(audit["rendezvous_dir"]).exists()
-    # Probe both listening state and rebinding after the rendezvous server exits.
-    with socket.socket() as probe:
-        probe.settimeout(0.2)
-        audit["port_listening"] = probe.connect_ex(("127.0.0.1", port)) == 0
-    with socket.socket() as probe:
-        if os.name != "nt":
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            probe.bind(("127.0.0.1", port))
-            audit["port_reusable"] = True
-        except OSError:
-            audit["port_reusable"] = False
+    audit["port_listening"], audit["port_reusable"] = audit_tcp_ports((port,))
     audit["clean"] = (not audit["leaked_pids"] and audit["rendezvous_removed"]
                       and not audit["port_listening"] and audit["port_reusable"]
                       and all(not w["alive"] for w in audit["workers"]))

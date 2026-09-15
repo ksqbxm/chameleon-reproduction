@@ -4,8 +4,9 @@ import json
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import ReroutingTopology, RuntimeErrorWithAudit, SymmetricRuntime
-from test_symmetric_training import assert_numerical_step, assert_trace_dependencies
+from chameleon.runtime import DistributedRuntime, ReroutingTopology, RuntimeErrorWithAudit
+from conftest import assert_numerical_step
+from test_symmetric_training import assert_trace_dependencies
 
 
 def assert_rerouted_numerics(result):
@@ -166,7 +167,7 @@ def test_rerouted_worker_error_or_timeout_never_commit_and_cleanup(distributed_e
     topology = ReroutingTopology(ClusterState(tuple(WorkerIdentity(f"failure-{r}", r, 0) for r in range(5)), 19),
                                 config, (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head")),
                                 (5, 3, 2), ((0, None), (1, 2), (3, 4)))
-    runtime = SymmetricRuntime(topology, device=device, behavior=behavior)
+    runtime = DistributedRuntime(topology, device=device, behavior=behavior)
     with pytest.raises(RuntimeErrorWithAudit, match="hard timeout" if behavior == "hang" else "injected|abnormally") as caught:
         with runtime:
             runtime.timeout_s = 5

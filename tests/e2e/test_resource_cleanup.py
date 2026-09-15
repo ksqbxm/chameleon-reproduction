@@ -3,7 +3,7 @@
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import RuntimeErrorWithAudit, SymmetricRuntime, SymmetricTopology
+from chameleon.runtime import DistributedRuntime, RuntimeErrorWithAudit, SymmetricTopology
 
 
 @pytest.mark.parametrize("round_id", range(3))
@@ -24,7 +24,7 @@ def test_short_timeout_cleanup_stress_has_no_deadlock_pid_or_port_leak(round_id,
                     for rank in range(size))
     topology = SymmetricTopology(ClusterState(workers, 24, generation=200 + round_id),
                                  config, stages)
-    runtime = SymmetricRuntime(topology, device=device, behavior="hang")
+    runtime = DistributedRuntime(topology, device=device, behavior="hang")
     with runtime:
         pids = [row["pid"] for row in runtime.ready]
         assert len(set(pids)) == size

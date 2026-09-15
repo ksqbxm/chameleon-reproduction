@@ -170,11 +170,12 @@ def _metadata_recovery_worker(topology, rank, device, backend, dtype, store, tim
 def _metadata_decision(recovery, config):
     """Independent controlled manifest oracle for the controller protocol."""
     from chameleon.coloring import conflict_graph, dsatur
-    from chameleon.decision_center import PolicyCandidate, select_policy
+    from chameleon.decision_center import PolicyCandidate
+    from conftest import _select_candidates
     from chameleon.estimators import TimeEstimate
     from chameleon.hungarian import hungarian
     from chameleon.planner import DynamicPlan
-    from chameleon.profiler import _hash
+    from chameleon.contracts import stable_hash
     from chameleon.restorer import MigrationManifest, TargetSlot, TensorAction, TransitionEstimate, synchronization_rounds
     from chameleon.state_sources import build_state_source_map
 
@@ -182,7 +183,7 @@ def _metadata_decision(recovery, config):
     modules = ("embedding", "blocks.0", "blocks.1", "final_norm", "lm_head")
     layouts = ((modules,), (("embedding", "blocks.0"), modules[2:]))
     time = TimeEstimate(1., dict(layouts=layouts, profile_hash="controlled", pipeline_micro_batches=(2, 4),
-        global_micro_batches=6, profile_identity={"config_hash": _hash(asdict(config))}))
+        global_micro_batches=6, profile_identity={"config_hash": stable_hash(asdict(config))}))
     plan = DynamicPlan(11, sources.state.generation, sources.state.workers, "controlled", (1, 2), (2, 4), layouts, time, ())
     slots = tuple(TargetSlot(p, s, row) for p, layout in enumerate(layouts) for s, row in enumerate(layout))
     costs = tuple(tuple(sum(t.nbytes for t in sources.required if t.module_id in slot.modules and t not in i.tensors)
@@ -198,14 +199,14 @@ def _metadata_decision(recovery, config):
         {key: (a.source.worker_id, a.destination.worker_id) for key, a in transfers.items()})))
     held = tuple((i.worker, t) for i in sources.inventories for t in i.tensors)
     targets = {(a.destination, a.tensor) for a in actions}
-    identity = "migration-" + _hash(dict(plan_id=plan.plan_id, committed_global_step=sources.state.committed_global_step,
+    identity = "migration-" + stable_hash(dict(plan_id=plan.plan_id, committed_global_step=sources.state.committed_global_step,
                                        actions=tuple(asdict(a) for a in actions)))
     sync = synchronization_rounds({m: tuple(w.worker_id for slot, w in assignments if m in slot.modules) for m in modules})
     manifest = MigrationManifest(identity, plan, assignments, costs, matching.total_cost, actions, rounds, sync,
                                  held, tuple(pair for pair in held if pair not in targets))
     transition = TransitionEstimate(0., .01, None, {"source": "controlled metadata protocol test"}, identity)
     candidate = PolicyCandidate(plan.plan_id, "dynamic", 11, sources.state.generation, 1., transition, None, (), manifest, {})
-    return select_policy((candidate,), 100.)
+    return _select_candidates((candidate,), 100.)
 
 
 @pytest.fixture
@@ -213,7 +214,7 @@ def metadata_recovery_runtime(combination, monkeypatch):
     from functools import partial
     from chameleon import ClusterState, ModelConfig, WorkerIdentity
     from chameleon import runtime as module
-    from chameleon.runtime import SymmetricRuntime, SymmetricTopology
+    from chameleon.runtime import DistributedRuntime, SymmetricTopology
 
     _, sources, _, _ = combination
     required = tuple(t for t in sources.required if t.module_id != "extra")
@@ -223,20 +224,20 @@ def metadata_recovery_runtime(combination, monkeypatch):
     config = ModelConfig(num_layers=2, global_batch_size=11, micro_batch_size=2)
     topology = SymmetricTopology(ClusterState(tuple(WorkerIdentity(f"stable-{i}", i, 0) for i in range(4)), 11),
                                 config, (("embedding",), ("blocks.0", "blocks.1", "final_norm", "lm_head")))
-    return SymmetricRuntime(topology, timeout_s=15)
+    return DistributedRuntime(topology, timeout_s=15)
 
 
 def _prepare_failure(runtime):
-    from conftest import _kill_at_safe_point
+    from conftest import _kill_workers
     for _ in range(3):
         runtime.train_step()
     runtime.inspect_state()
-    failure = _kill_at_safe_point(runtime, (1,))
+    failure, _ = _kill_workers(runtime, (1,), timeout_s=5)
     return failure, runtime.recovery_state(failure)
 
 
 def test_failure_facts_are_validated_before_decision_freshness(metadata_recovery_runtime):
-    from conftest import _kill_at_safe_point
+    from conftest import _kill_workers
     from chameleon.contracts import FailureEvent
 
     runtime = metadata_recovery_runtime
@@ -244,7 +245,7 @@ def test_failure_facts_are_validated_before_decision_freshness(metadata_recovery
         first_failure, first_recovery = _prepare_failure(runtime)
         stale = _rerouting_decision(first_recovery)
         runtime.recover(first_failure, stale)
-        complete = _kill_at_safe_point(runtime, (0,))
+        complete, _ = _kill_workers(runtime, (0,), timeout_s=5)
         incomplete = FailureEvent((runtime.topology.ranks[1].worker_id,), complete.generation,
                                   complete.committed_global_step)
         stores = tuple(runtime._stores)
@@ -282,13 +283,14 @@ def test_survivor_control_protocol_commits_only_after_all_target_acks(metadata_r
 
 
 def _rerouting_decision(recovery):
-    from chameleon.decision_center import PolicyCandidate, ReroutingPlan, select_policy
+    from chameleon.decision_center import PolicyCandidate, ReroutingPlan
+    from conftest import _select_candidates
     from chameleon.estimators import TimeEstimate
     from chameleon.restorer import TransitionEstimate
     plan = ReroutingPlan(recovery, "controlled", TimeEstimate(1., {}), (), ())
     candidate = PolicyCandidate(plan.plan_id, "rerouting", recovery.cluster.global_batch_size,
         recovery.cluster.generation, 1., TransitionEstimate(0., 0., None, {}, None), None, (), plan, {})
-    return select_policy((candidate,), 100.)
+    return _select_candidates((candidate,), 100.)
 
 
 def test_rerouting_rejects_changed_retained_tensor_values(metadata_recovery_runtime, monkeypatch):
@@ -357,13 +359,13 @@ def test_recovery_preflight_consumes_the_same_hard_timeout(metadata_recovery_run
 
 
 def test_recovery_state_preserves_existing_missing_logical_slots(metadata_recovery_runtime):
-    from conftest import _kill_at_safe_point
+    from conftest import _kill_workers
     runtime = metadata_recovery_runtime
     with runtime:
         failure, recovery = _prepare_failure(runtime)
         runtime.recover(failure, _rerouting_decision(recovery))
         # One stage-zero replica survives a further loss; the already-missing tail slot stays absent.
-        failure = _kill_at_safe_point(runtime, (0,))
+        failure, _ = _kill_workers(runtime, (0,), timeout_s=5)
         recovery = runtime.recovery_state(failure)
         assert recovery.pipeline_workers[0][1] is None
         assert len(recovery.survivor_state.workers) == 2
@@ -377,14 +379,14 @@ def test_recovery_state_preserves_existing_missing_logical_slots(metadata_recove
 
 
 def test_recovery_refreshes_live_state_after_cached_schema_was_inspected(metadata_recovery_runtime):
-    from conftest import _kill_at_safe_point
+    from conftest import _kill_workers
     runtime = metadata_recovery_runtime
     with runtime:
         for _ in range(3):
             runtime.train_step()
         runtime.inspect_state()
         runtime.train_step()
-        failure = _kill_at_safe_point(runtime, (1,))
+        failure, _ = _kill_workers(runtime, (1,), timeout_s=5)
         recovery = runtime.recovery_state(failure)
         assert all(i.committed_global_step == 4 for i in recovery.inventories)
         runtime.recover(failure, _metadata_decision(recovery, runtime.topology.config))

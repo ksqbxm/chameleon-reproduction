@@ -4,7 +4,8 @@ import json
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import RuntimeErrorWithAudit, SymmetricRuntime, SymmetricTopology
+from chameleon.runtime import DistributedRuntime, RuntimeErrorWithAudit, SymmetricTopology
+from conftest import assert_numerical_step
 
 
 def assert_p2p_warmup(runtime):
@@ -22,38 +23,6 @@ def assert_p2p_warmup(runtime):
                 assert row["tensor_bytes"] == shape[0] * shape[1] * shape[2] * element_size
                 assert row["device"] == (f"cuda:{rank}" if runtime.device == "cuda" else "cpu")
                 assert row["value"] == (rank if row["action"] == "send" else row["peer_rank"]) + 1
-
-
-def assert_numerical_step(actual, expected, device, *, fp32=False, owner_counts=None):
-    import torch
-
-    tolerance = (dict(rtol=1e-4, atol=1e-6) if fp32 else
-                 dict(rtol=1e-7, atol=1e-9) if device == "cuda" else dict(rtol=1e-8, atol=1e-10))
-    assert actual["sample_ids"] == list(expected.sample_ids)
-    assert actual["global_sample_count"] == expected.global_sample_count
-    assert actual["step_id"] == expected.committed_global_step
-    assert actual["loss_global_sum"] == pytest.approx(expected.loss_global_sum,
-                                                     rel=tolerance["rtol"], abs=tolerance["atol"])
-    owners = Counter()
-    for report, snapshot in zip(actual["reports"], actual["snapshots"]):
-        assert set(snapshot) == {"parameters", "gradients", "optimizer_state"}
-        assert snapshot["parameters"].keys() == snapshot["gradients"].keys() == snapshot["optimizer_state"].keys()
-        assert set(report["synchronized_parameters"]) == snapshot["parameters"].keys()
-        for name, parameter in snapshot["parameters"].items():
-            owners[name] += 1
-            torch.testing.assert_close(parameter, expected.parameters[name], **tolerance,
-                                       msg=lambda message: f"step {actual['step_id']}, {name}, parameter: {message}")
-            torch.testing.assert_close(snapshot["gradients"][name], expected.gradients[name], **tolerance,
-                                       msg=lambda message: f"step {actual['step_id']}, {name}, gradient: {message}")
-            state = snapshot["optimizer_state"][name]
-            assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
-            for field, value in state.items():
-                torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance,
-                                           msg=lambda message: f"step {actual['step_id']}, {name}, AdamW.{field}: {message}")
-    dp_size = len({report["pipeline"] for report in actual["reports"]})
-    assert owners == Counter(owner_counts if owner_counts is not None else
-                             {name: dp_size for name in expected.parameters})
-    assert {name.split(".")[0] for name in owners} == {"embedding", "blocks", "final_norm", "lm_head"}
 
 
 def assert_trace_dependencies(reports, stages, count):
@@ -172,7 +141,7 @@ def test_small_schedules_and_fp32_smoke(distributed_environment, device, world_s
                          sequence_length=3, global_batch_size=batch, micro_batch_size=micro)
     topology = SymmetricTopology(ClusterState(tuple(WorkerIdentity(f"small-{rank}", rank, 0) for rank in range(4)), batch), config, stages)
     dtype = "float32" if case == "fp32" else "float64"
-    runtime = SymmetricRuntime(topology, device=device, dtype=dtype, capture_state=True)
+    runtime = DistributedRuntime(topology, device=device, dtype=dtype, capture_state=True)
     with runtime:
         steps = [runtime.train_step() for _ in range(3 if case == "fp32" else 1)]
     assert_p2p_warmup(runtime)
@@ -193,7 +162,7 @@ def test_runtime_failure_and_hard_timeout_never_commit_and_clean(distributed_env
     config = ModelConfig(num_layers=2, global_batch_size=2, micro_batch_size=1)
     topology = SymmetricTopology(ClusterState(tuple(WorkerIdentity(f"failure-{rank}", rank, 0) for rank in range(4)), 2),
                                  config, (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head")))
-    runtime = SymmetricRuntime(topology, device=device, behavior=behavior)
+    runtime = DistributedRuntime(topology, device=device, behavior=behavior)
     with pytest.raises(RuntimeErrorWithAudit, match="hard timeout" if behavior == "hang" else "injected|abnormally") as caught:
         with runtime:
             runtime.timeout_s = 5  # Startup has its own longer bound; the stalled training step has a hard bound.

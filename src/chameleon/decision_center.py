@@ -6,12 +6,11 @@ from time import perf_counter
 
 from .contracts import (
     ClusterState, DecisionResult, ExecutionPlan, FailureEvent, ModelConfig,
-    UnrecoverableStateError, WorkerIdentity, _finite, _integer,
+    UnrecoverableStateError, WorkerIdentity, _finite, _integer, stable_hash,
 )
 from .estimators import Estimator, MemoryEstimate, TimeEstimate, estimate_rerouting_time
 from .planner import DynamicPlan, NoFeasibleDynamicPlanError, Planner
 from .plan_cache import PlanCache
-from .profiler import _hash
 from .restorer import MigrationManifest, MissingTransitionCalibrationError, Restorer, TransitionEstimate
 from .state_sources import StateTensor, WorkerInventory, build_state_source_map
 
@@ -56,7 +55,7 @@ class RecoveryState:
             raise ValueError("recovery inventories must be immutable metadata tuples")
         failure = asdict(self.failure)
         failure["failed_worker_ids"] = tuple(sorted(self.failure.failed_worker_ids))
-        object.__setattr__(self, "recovery_id", _hash({"failure": failure, "B": self.cluster.global_batch_size,
+        object.__setattr__(self, "recovery_id", stable_hash({"failure": failure, "B": self.cluster.global_batch_size,
             "layouts": self.layouts, "micro_batches": self.pipeline_micro_batches,
             "workers": tuple(tuple(asdict(w) if w is not None else None for w in pipeline)
                              for pipeline in self.pipeline_workers)}))
@@ -90,7 +89,7 @@ class ReroutingPlan:
     def __post_init__(self):
         if not isinstance(self.routes, tuple):
             raise ValueError("routes must be an immutable tuple")
-        object.__setattr__(self, "plan_id", "rerouting-" + _hash({"recovery_id": self.state.recovery_id,
+        object.__setattr__(self, "plan_id", "rerouting-" + stable_hash({"recovery_id": self.state.recovery_id,
             "profile": self.profile_hash, "routes": tuple(asdict(route) for route in self.routes)}))
 
     @property
@@ -194,52 +193,6 @@ class NoUsablePolicyError(RuntimeError):
         super().__init__("no usable policy: " + ("; ".join(details) or "no candidates"))
 
 
-def select_policy(candidates: tuple[PolicyCandidate, ...], inter_fault_duration_s=None) -> PolicyDecision:
-    """D is supplied by the caller; no MTBF prediction or step-only fallback."""
-    _finite("inter_fault_duration_s", inter_fault_duration_s, positive=True)
-    candidates = tuple(candidates)
-    if (len({c.policy for c in candidates}) != len(candidates)
-            or len({c.plan_id for c in candidates}) != len(candidates)
-            or len({(c.global_batch_size, c.generation) for c in candidates}) > 1):
-        raise ValueError("candidates must have unique policies/plan IDs and the same batch/generation")
-    duration = inter_fault_duration_s
-    record = {"equation": 8, "B": candidates[0].global_batch_size if candidates else None,
-              "D": duration, "duration_source": "caller supplied inter-fault duration; not predicted",
-              "formula": "(B / t_step) * ((D - t_transition) / D)",
-              "transition_model": "policy-specific paper model; measured common control is reported separately",
-              "tie_break": "smaller transition, then stable plan ID (project rule)", "candidates": []}
-    usable = []
-    for candidate in candidates:
-        row = asdict(candidate)
-        row.update(estimated_transition_time_s=candidate.estimated_transition_time_s,
-                   feasible=candidate.feasible, score=None, throughput_samples_s=None, useful_window_fraction=None,
-                   selected=False, rejection_reasons=candidate.reasons)
-        record["candidates"].append(row)
-        if not candidate.feasible:
-            continue
-        step, transition = candidate.estimated_step_time_s, candidate.estimated_transition_time_s
-        if duration <= transition:
-            row["rejection_reasons"] = ("D <= t_transition: candidate unavailable in this window",)
-            continue
-        throughput = candidate.global_batch_size / step
-        fraction = (duration - transition) / duration
-        score = throughput * fraction
-        _finite("Equation 8 score", score, positive=True)
-        row.update(score=score, throughput_samples_s=throughput, useful_window_fraction=fraction)
-        usable.append((candidate, score, row))
-    if not usable:
-        raise NoUsablePolicyError(record)
-    winner, score, selected_row = min(usable, key=lambda item: (
-        -item[1], item[0].estimated_transition_time_s, item[0].plan_id))
-    for _, _, row in usable:
-        if row is not selected_row:
-            row["rejection_reasons"] = ("lower Equation 8 score" if row["score"] < score
-                                       else "lost deterministic tie-break",)
-    selected_row["selected"] = True
-    record.update(selected_policy=winner.policy, selected_plan_id=winner.plan_id)
-    return PolicyDecision(winner.execution_plan, duration, score, winner, record)
-
-
 class DecisionCenter:
     def __init__(self, config: ModelConfig, *, expected_identity: dict, r_dp, r_pp,
                  memory_capacity_bytes: int, plan_cache: PlanCache | None = None):
@@ -285,14 +238,14 @@ class DecisionCenter:
     def _rerouting(self, state, estimator, common_control, source_reasons):
         survivors = state.survivor_state
         dp, layout = len(state.layouts), state.layouts[0]
-        profile_hash = _hash(estimator.profile)
+        profile_hash = stable_hash(estimator.profile)
         transition = TransitionEstimate(0., 0., common_control,
                                        {"source": "rerouting paper-model approximation of zero"}, None)
         derivation = {"policy_transition_source": "rerouting paper-model approximation of zero",
                       "common_control_source": "measured bootstrap proxy" if common_control is not None else "unmeasured",
                       "original_layouts": state.layouts, "original_micro_batches": state.pipeline_micro_batches}
         if any(other != layout for other in state.layouts) or len(set(state.pipeline_micro_batches)) != 1:
-            return PolicyCandidate("rerouting-unavailable-" + _hash({"recovery": state.recovery_id,
+            return PolicyCandidate("rerouting-unavailable-" + stable_hash({"recovery": state.recovery_id,
                 "profile": profile_hash}), "rerouting", survivors.global_batch_size, survivors.generation,
                 None, transition, common_control, (), None, derivation, source_reasons + (
                 "Eq.12/13 requires identical original layouts and equal integer micro-batches per pipeline",))
@@ -399,8 +352,8 @@ class DecisionCenter:
             search_time = 0. if lookup.hit else perf_counter() - start
             cache_record = {"enabled": True, "key": lookup.key, "hit": lookup.hit}
         if dynamic is None:
-            plan_id = rejected.plan_id if rejected else "dynamic-unavailable-" + _hash({
-                "recovery": state.recovery_id, "profile": _hash(profile), "Rdp": planner.r_dp,
+            plan_id = rejected.plan_id if rejected else "dynamic-unavailable-" + stable_hash({
+                "recovery": state.recovery_id, "profile": stable_hash(profile), "Rdp": planner.r_dp,
                 "Rpp": planner.r_pp, "capacity": planner.memory_capacity_bytes})
             candidate = PolicyCandidate(plan_id, "dynamic", survivors.global_batch_size,
                 survivors.generation, None, None, common, rejected.memory if rejected else (), rejected,
@@ -423,6 +376,47 @@ class DecisionCenter:
                                     execution, derivation, reasons)
         return rerouting, candidate
 
-    def select(self, state: RecoveryState, profile: dict, inter_fault_duration_s=None) -> PolicyDecision:
+    def select(self, state: RecoveryState, profile: dict, inter_fault_duration_s) -> PolicyDecision:
+        """Evaluate once and select by Equation 8 using caller-supplied D."""
         _finite("inter_fault_duration_s", inter_fault_duration_s, positive=True)
-        return select_policy(self.evaluate_candidates(state, profile), inter_fault_duration_s)
+        candidates = tuple(self.evaluate_candidates(state, profile))
+        if (len({candidate.policy for candidate in candidates}) != len(candidates)
+                or len({candidate.plan_id for candidate in candidates}) != len(candidates)
+                or len({(candidate.global_batch_size, candidate.generation) for candidate in candidates}) > 1):
+            raise ValueError("candidates must have unique policies/plan IDs and the same batch/generation")
+        duration = inter_fault_duration_s
+        record = {"equation": 8, "B": candidates[0].global_batch_size if candidates else None,
+                  "D": duration, "duration_source": "caller supplied inter-fault duration; not predicted",
+                  "formula": "(B / t_step) * ((D - t_transition) / D)",
+                  "transition_model": "policy-specific paper model; measured common control is reported separately",
+                  "tie_break": "smaller transition, then stable plan ID (project rule)", "candidates": []}
+        usable = []
+        for candidate in candidates:
+            row = asdict(candidate)
+            row.update(estimated_transition_time_s=candidate.estimated_transition_time_s,
+                       feasible=candidate.feasible, score=None, throughput_samples_s=None,
+                       useful_window_fraction=None, selected=False, rejection_reasons=candidate.reasons)
+            record["candidates"].append(row)
+            if not candidate.feasible:
+                continue
+            step, transition = candidate.estimated_step_time_s, candidate.estimated_transition_time_s
+            if duration <= transition:
+                row["rejection_reasons"] = ("D <= t_transition: candidate unavailable in this window",)
+                continue
+            throughput = candidate.global_batch_size / step
+            fraction = (duration - transition) / duration
+            score = throughput * fraction
+            _finite("Equation 8 score", score, positive=True)
+            row.update(score=score, throughput_samples_s=throughput, useful_window_fraction=fraction)
+            usable.append((candidate, score, row))
+        if not usable:
+            raise NoUsablePolicyError(record)
+        winner, score, selected_row = min(usable, key=lambda item: (
+            -item[1], item[0].estimated_transition_time_s, item[0].plan_id))
+        for _, _, row in usable:
+            if row is not selected_row:
+                row["rejection_reasons"] = ("lower Equation 8 score" if row["score"] < score
+                                           else "lost deterministic tie-break",)
+        selected_row["selected"] = True
+        record.update(selected_policy=winner.policy, selected_plan_id=winner.plan_id)
+        return PolicyDecision(winner.execution_plan, duration, score, winner, record)

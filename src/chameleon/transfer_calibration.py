@@ -5,19 +5,19 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
-import socket
 import tempfile
 import time
 import traceback
 
-from .contracts import _finite, _integer
-from .environment import _write_record, validate_device
+from .contracts import _finite, _integer, require_exact_fields
+from .environment import validate_device
+from .process_control import (ProcessAuditError, audit_tcp_ports, child_process_leaks,
+                              close_processes, reserve_tcp_ports, terminate_processes,
+                              wait_processes, write_json_atomic)
 
 
-class CalibrationError(RuntimeError):
-    def __init__(self, message, audit):
-        super().__init__(message)
-        self.audit = audit
+class CalibrationError(ProcessAuditError):
+    pass
 
 
 def _validate_sizes(sizes):
@@ -97,7 +97,7 @@ def _calibration_worker(rank, device, backend, ports, directory, sizes, warmup,
             if dist.is_initialized():
                 dist.destroy_process_group()
         finally:
-            _write_record(directory, rank, record)
+            write_json_atomic(Path(directory, f"rank-{rank}.json"), record)
 
 
 def run_transfer_calibration(device: str, world_size: int = 2, *,
@@ -117,20 +117,7 @@ def run_transfer_calibration(device: str, world_size: int = 2, *,
     backend = validate_device(device, world_size)
     root = Path(artifact_dir)
     root.mkdir(parents=True, exist_ok=True)
-    reservations = []
-    try:
-        for _ in range(bootstrap_rounds + 1):
-            reservation = socket.socket()
-            try:
-                reservation.bind(("127.0.0.1", 0))
-            except BaseException:
-                reservation.close()
-                raise
-            reservations.append(reservation)
-        ports = tuple(reservation.getsockname()[1] for reservation in reservations)
-    finally:
-        for reservation in reservations:
-            reservation.close()
+    ports = reserve_tcp_ports(bootstrap_rounds + 1)
     baseline = {p.pid for p in mp.active_children()}
     context = mp.get_context("spawn")
     processes, records, error = [], [], None
@@ -145,54 +132,17 @@ def run_transfer_calibration(device: str, world_size: int = 2, *,
                           iterations, timeout_s))
                 process.start()
                 processes.append(process)
-            while True:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"calibration exceeded hard timeout {timeout_s}s")
-                alive = any(p.is_alive() for p in processes)
-                if any(p.exitcode not in (None, 0) for p in processes):
-                    raise RuntimeError("calibration worker exited abnormally")
-                if not alive:
-                    break
-                time.sleep(0.02)
+            wait_processes(processes, deadline, "calibration")
         except BaseException as exc:
             error = exc
         finally:
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-            cleanup_deadline = time.monotonic() + 5
-            for process in processes:
-                process.join(max(0, cleanup_deadline - time.monotonic()))
-            for process in processes:
-                if process.is_alive():
-                    process.kill()
-            cleanup_deadline = time.monotonic() + 5
-            for process in processes:
-                process.join(max(0, cleanup_deadline - time.monotonic()))
-            audit["workers"] = [{"pid": p.pid, "exitcode": p.exitcode, "alive": p.is_alive()}
-                                for p in processes]
-            audit["leaked_pids"] = sorted({p.pid for p in mp.active_children()} - baseline)
+            audit["workers"] = terminate_processes(processes)
+            audit["leaked_pids"] = child_process_leaks(baseline)
             records = [json.loads(path.read_text(encoding="utf-8"))
                        for path in sorted(Path(directory).glob("rank-*.json"))]
-            for process in processes:
-                if not process.is_alive():
-                    process.close()
+            close_processes(processes)
     audit["rendezvous_removed"] = not Path(audit["rendezvous_dir"]).exists()
-    listening, reusable = [], []
-    for port in ports:
-        with socket.socket() as probe:
-            probe.settimeout(0.2)
-            listening.append(probe.connect_ex(("127.0.0.1", port)) == 0)
-        with socket.socket() as probe:
-            if os.name != "nt":
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                probe.bind(("127.0.0.1", port))
-                reusable.append(True)
-            except OSError:
-                reusable.append(False)
-    audit["port_listening"] = any(listening)
-    audit["port_reusable"] = all(reusable)
+    audit["port_listening"], audit["port_reusable"] = audit_tcp_ports(ports)
     audit["clean"] = (not audit["leaked_pids"] and audit["rendezvous_removed"]
                       and not audit["port_listening"] and audit["port_reusable"]
                       and all(not w["alive"] for w in audit["workers"]))
@@ -216,9 +166,9 @@ def run_transfer_calibration(device: str, world_size: int = 2, *,
 
 
 def validate_calibration(report: dict) -> None:
-    from .profiler import _keys, _validate_device_identity
-    _keys(report, ("schema_version", "device", "backend", "world_size", "tensor_bytes", "iterations",
-                   "bootstrap_rounds", "records", "audit", "error"), "calibration")
+    from .profiler import validate_device_identity
+    require_exact_fields(report, ("schema_version", "device", "backend", "world_size", "tensor_bytes", "iterations",
+                                  "bootstrap_rounds", "records", "audit", "error"), "calibration")
     if (type(report["schema_version"]) is not int or report["schema_version"] != 1
             or type(report["world_size"]) is not int or report["world_size"] != 2
             or report["device"] not in ("cpu", "cuda")
@@ -235,20 +185,20 @@ def validate_calibration(report: dict) -> None:
             or any(not isinstance(r, dict) for r in records)):
         raise ValueError("calibration requires records from two distinct real ranks")
     for record in records:
-        _keys(record, ("rank", "worker_id", "generation", "pid", "device_identity",
-                       "group_bootstrap_s", "transfers", "verified"), "rank calibration")
+        require_exact_fields(record, ("rank", "worker_id", "generation", "pid", "device_identity",
+                                      "group_bootstrap_s", "transfers", "verified"), "rank calibration")
         _integer("rank", record["rank"], 0)
         _integer("pid", record["pid"])
         _integer("generation", record["generation"], 0)
     if {r["rank"] for r in records} != {0, 1} or len({r["pid"] for r in records}) != 2:
         raise ValueError("calibration requires records from two distinct real ranks")
     audit = report["audit"]
-    _keys(audit, ("port", "rendezvous_dir", "workers", "leaked_pids", "rendezvous_removed",
-                  "port_listening", "port_reusable", "clean"), "calibration audit")
+    require_exact_fields(audit, ("port", "rendezvous_dir", "workers", "leaked_pids", "rendezvous_removed",
+                                 "port_listening", "port_reusable", "clean"), "calibration audit")
     if not isinstance(audit["workers"], list) or len(audit["workers"]) != 2:
         raise ValueError("invalid calibration worker audit")
     for worker in audit["workers"]:
-        _keys(worker, ("pid", "exitcode", "alive"), "worker audit")
+        require_exact_fields(worker, ("pid", "exitcode", "alive"), "worker audit")
         _integer("worker pid", worker["pid"])
         if worker["alive"] is not False or type(worker["exitcode"]) is not int or worker["exitcode"] != 0:
             raise ValueError("calibration workers must exit successfully")
@@ -261,7 +211,7 @@ def validate_calibration(report: dict) -> None:
     expected = {(src, dst, size, iteration) for src, dst in ((0, 1), (1, 0))
                 for size in sizes for iteration in range(report["iterations"])}
     for record in records:
-        _validate_device_identity(record["device_identity"])
+        validate_device_identity(record["device_identity"])
         if not isinstance(record["group_bootstrap_s"], list):
             raise ValueError("invalid group bootstrap samples")
         if (record["verified"] is not True or record["worker_id"] != f"calibration-{record['rank']}"
@@ -277,8 +227,8 @@ def validate_calibration(report: dict) -> None:
             raise ValueError("invalid transfer sample list")
         observed = set()
         for row in transfers:
-            _keys(row, ("source", "destination", "tensor_bytes", "iteration",
-                        "execution_time_s", "wall_time_s"), "transfer sample")
+            require_exact_fields(row, ("source", "destination", "tensor_bytes", "iteration",
+                                       "execution_time_s", "wall_time_s"), "transfer sample")
             for name in ("source", "destination", "iteration"):
                 _integer(name, row[name], 0)
             _integer("tensor_bytes", row["tensor_bytes"])

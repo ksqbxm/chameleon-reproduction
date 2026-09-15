@@ -7,7 +7,7 @@ import multiprocessing as mp
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.runtime import ReroutingTopology, RuntimeErrorWithAudit, SymmetricRuntime
+from chameleon.runtime import DistributedRuntime, ReroutingTopology, RuntimeErrorWithAudit
 from chameleon.rerouting import execution_rounds, validate_routing_reports
 
 
@@ -88,7 +88,7 @@ def test_invalid_pipeline_stage_or_micro_batch(task):
 def test_committed_state_cannot_be_initialized_and_step_identity_cannot_change():
     current = topology()
     with pytest.raises(ValueError, match="already committed"):
-        SymmetricRuntime(replace(current, state=replace(current.state, committed_global_step=1)))
+        DistributedRuntime(replace(current, state=replace(current.state, committed_global_step=1)))
     with pytest.raises(ValueError, match="topology"):
         current.micro_batches(replace(current.state, generation=3,
                                       workers=tuple(replace(w, generation=3) for w in current.state.workers)), 0)
@@ -271,7 +271,7 @@ def test_routing_audit_runs_before_commit_with_real_metadata_process_cleanup(mon
     from chameleon import runtime as module
     monkeypatch.setattr(module, "validate_device", lambda *_: "metadata")
     monkeypatch.setattr(module, "_runtime_worker", partial(_routing_metadata_worker, fault=fault))
-    runtime = SymmetricRuntime(topology())
+    runtime = DistributedRuntime(topology())
     if fault:
         with pytest.raises(RuntimeErrorWithAudit, match="routing"):
             with runtime:

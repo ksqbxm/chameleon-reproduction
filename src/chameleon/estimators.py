@@ -8,8 +8,8 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
 
-from .contracts import _finite, _integer
-from .profiler import _hash, validate_snapshot
+from .contracts import _finite, _integer, stable_hash
+from .profiler import validate_snapshot
 from .schedule import OperationKey, build_1f1b_schedule
 
 
@@ -231,7 +231,7 @@ class Estimator:
             "equation": 10, "pipeline_equation": 11, "global_micro_batches": global_micro_batches,
             "pipeline_micro_batches": pipeline_micro_batches,
             "layouts": layouts,
-            "profile_hash": _hash(self.profile),
+            "profile_hash": stable_hash(self.profile),
             "pipeline_times_s": tuple(e.step_time_s for e in estimates),
             "pipelines": tuple(e.derivation for e in estimates),
             "profile_identity": deepcopy(self.profile["identity"]),

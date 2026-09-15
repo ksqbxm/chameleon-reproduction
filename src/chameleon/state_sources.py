@@ -42,7 +42,7 @@ def adamw_inventory(model, optimizer, *, committed_global_step: int) -> tuple[St
 
     if (not isinstance(optimizer, torch.optim.AdamW)
             or any(group["amsgrad"] for group in optimizer.param_groups)):
-        raise ValueError("recovery requires standard AdamW with amsgrad=False")
+        raise ValueError("state inventory requires standard AdamW with amsgrad=False")
     parameters = dict(model.named_parameters())
     trainable = {p for p in parameters.values() if p.requires_grad}
     owned = [p for group in optimizer.param_groups for p in group["params"]]

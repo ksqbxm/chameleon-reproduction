@@ -7,47 +7,10 @@ import json
 import pytest
 
 from chameleon import ClusterState, ModelConfig, WorkerIdentity
-from chameleon.contracts import FailureEvent
-from chameleon.decision_center import DecisionCenter, select_policy
+from chameleon.decision_center import DecisionCenter
 from chameleon.restorer import MigrationManifest
-from chameleon.runtime import DynamicTopology, ReroutingTopology, SymmetricRuntime, SymmetricTopology
-
-
-def _assert_numerical_step(actual, expected, device, owner_counts):
-    import torch
-
-    tolerance = dict(rtol=1e-7, atol=1e-9) if device == "cuda" else dict(rtol=1e-8, atol=1e-10)
-    assert actual["sample_ids"] == list(expected.sample_ids)
-    assert actual["global_sample_count"] == expected.global_sample_count
-    assert actual["step_id"] == expected.committed_global_step
-    assert actual["loss_global_sum"] == pytest.approx(expected.loss_global_sum,
-                                                     rel=tolerance["rtol"], abs=tolerance["atol"])
-    owners = Counter()
-    for report, snapshot in zip(actual["reports"], actual["snapshots"]):
-        assert set(snapshot) == {"parameters", "gradients", "optimizer_state"}
-        assert snapshot["parameters"].keys() == snapshot["gradients"].keys() == snapshot["optimizer_state"].keys()
-        assert set(report["synchronized_parameters"]) == snapshot["parameters"].keys()
-        for name, parameter in snapshot["parameters"].items():
-            owners[name] += 1
-            torch.testing.assert_close(parameter, expected.parameters[name], **tolerance)
-            torch.testing.assert_close(snapshot["gradients"][name], expected.gradients[name], **tolerance)
-            state = snapshot["optimizer_state"][name]
-            assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
-            for field, value in state.items():
-                torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance)
-    assert owners == Counter(owner_counts)
-    assert {name.split(".")[0] for name in owners} == {"embedding", "blocks", "final_norm", "lm_head"}
-
-
-def _kill_one_stage_worker(runtime):
-    failed_rank = 1
-    failed_worker = runtime.topology.ranks[failed_rank]
-    process = runtime.processes[failed_rank]
-    process.kill()
-    process.join(10)
-    assert not process.is_alive() and process.exitcode not in (None, 0)
-    return FailureEvent((failed_worker.worker_id,), runtime.state.generation,
-                        runtime.state.committed_global_step), process.pid
+from chameleon.runtime import DistributedRuntime, DynamicTopology, ReroutingTopology, SymmetricTopology
+from conftest import _kill_workers, _logged_hashes, _reply_hashes, assert_numerical_step
 
 
 def _score(candidate, duration):
@@ -56,15 +19,16 @@ def _score(candidate, duration):
 
 
 def _run_case(case, topology, profile, device, request):
-    from conftest import _controlled_adaptive_profile
+    from conftest import _controlled_adaptive_profile, _select_candidates
 
-    runtime = SymmetricRuntime(topology, device=device, capture_state=True,
+    runtime = DistributedRuntime(topology, device=device, capture_state=True,
                                lr=.007, weight_decay=.125)
     with runtime:
         initial_ready = list(runtime.ready)
         steps = [runtime.train_step() for _ in range(3)]
         before = runtime.inspect_state()
-        failure, killed_pid = _kill_one_stage_worker(runtime)
+        failure, kill_audit = _kill_workers(runtime, (1,))
+        killed_pid = kill_audit[0]["pid"]
         recovery_state = runtime.recovery_state(failure)
         selection_profile = _controlled_adaptive_profile(
             profile, recovery_state.required, revision=0)
@@ -82,7 +46,7 @@ def _run_case(case, topology, profile, device, request):
         transition = dynamic.estimated_transition_time_s
         crossover = transition / (1 - dynamic.estimated_step_time_s / rerouting.estimated_step_time_s)
         duration = (transition + crossover) / 2 if case == "short" else crossover * 2
-        decision = select_policy(candidates, duration)
+        decision = _select_candidates(candidates, duration)
         recovery = runtime.recover(failure, decision)
         steps.extend(runtime.train_step() for _ in range(2))
     request.config._chameleon_reports.add(runtime.report_path)
@@ -126,16 +90,6 @@ def adaptive_policy_runs(request):
         lr=.007, weight_decay=.125)
     return dict(runs=runs, reference=[reference.train_step() for _ in range(5)],
                 device=device, dp=expected_size // 2)
-
-
-def _reply_hashes(replies):
-    return {row["worker"].worker_id: {tuple(item["key"]): item["digest"] for item in row["hashes"]}
-            for row in replies}
-
-
-def _logged_hashes(rows):
-    return {row["worker"]["worker_id"]: {tuple(item["key"]): item["digest"] for item in row["hashes"]}
-            for row in rows}
 
 
 def test_break_even_selects_rerouting_short_and_dynamic_long(adaptive_policy_runs):
@@ -211,7 +165,7 @@ def test_both_recovered_runs_match_uninterrupted_reference(adaptive_policy_runs)
                             {name: len(next(owners for module, owners in topology.module_owners.items()
                                             if name == module or name.startswith(module + ".")))
                              for name in expected.parameters})
-            _assert_numerical_step(actual, expected, adaptive_policy_runs["device"], owner_counts)
+            assert_numerical_step(actual, expected, adaptive_policy_runs["device"], owner_counts=owner_counts)
         assert result["recovery"]["committed_global_step"] == 3
         assert result["runtime"].state.committed_global_step == 5
         assert [step["step_id"] for step in result["steps"]] == [1, 2, 3, 4, 5]

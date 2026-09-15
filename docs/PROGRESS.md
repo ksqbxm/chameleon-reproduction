@@ -652,7 +652,7 @@ python -m pytest tests/distributed/test_symmetric_training.py tests/integration/
 - 已阅读 `CLAUDE.md`、总计划、Task09/10、进度和已有 Runtime、Profiler、Estimator、Planner、Restorer、模型、数据与分布式测试；仓库及祖先目录没有额外 AGENTS.md。按用户要求继续实现 Task10；Task09 的真实 CPU/GPU 待验状态不变。修改前 Git 工作区干净。
 - 修改范围：`src/chameleon/runtime.py`、`profiler.py`、`restorer.py`；`tests/conftest.py`、`tests/integration/test_profile_roundtrip.py`；新增 `tests/unit/test_dynamic_runtime_contracts.py`、`tests/distributed/test_asymmetric_training.py`、`test_colored_allreduce.py`、`tests/integration/test_planner_runtime.py`；以及本进度文件。没有修改依赖、环境、总计划或其他 task 文档。
 - `DynamicTopology` 支持每条 pipeline 独立的完整有序 layout、正整数 micro-batch 数和实际 worker/stage 映射，检查端点、dense ranks、固定 B、全局 Nm 和唯一 worker 覆盖。CPU 验收长度 [2,2,3]，GPU [2,3,3]；主验收 B=19、micro=2、Nm=10、分配 [5,3,2]，对应样本数 [10,6,3]，最后 micro-batch 为1个样本。连续 IDs 仅由 committed step 推导。
-- 复用现有 `SymmetricRuntime` 的唯一 worker、P2P、1F1B、控制协议、StepCommit 与 finally 清理路径；该 runtime 现在接受对称和 dynamic topology，没有另建执行器或兼容 adapter。stage 从显式映射寻找前后 peer，按真实 pipeline 深度和本地 micro-batch 数运行1F1B；支持 Restorer 分配后不连续、非单调的物理 ranks。controller 不构造初始完整模型。
+- 复用现有 `DistributedRuntime` 的唯一 worker、P2P、1F1B、控制协议、StepCommit 与 finally 清理路径；该 runtime 接受对称和 dynamic topology，没有另建执行器或兼容 adapter。stage 从显式映射寻找前后 peer，按真实 pipeline 深度和本地 micro-batch 数运行1F1B；支持 Restorer 分配后不连续、非单调的物理 ranks。controller 不构造初始完整模型。
 - 全 rank 按统一顺序创建、预热 PP groups 和参数 owner groups。具有相同 owners 的参数复用同一个实际 communicator，每个 trainable parameter 都有 owner 映射。Restorer manifest 与 Runtime 共享 DSATUR scheduling；每轮设备最多持有一个 module，实际对该 module 的全部参数发起 `all_reduce(SUM, async_op=True)`，等待本轮全部 Work 并同步 CUDA 后进入下一轮。不同 pipeline 完成 P2P 后统一进入归约，轮间 barrier 保证全局顺序。局部 backward 仅 SUM，owner SUM 后仅除一次 global sample count，再执行 AdamW。
 - 归约审计包含逐参数 module、实际 process-group ranks、color、SUM/divisor、async 标志、device/backend、字节和 launch/completion 时间。检查本地全部 trainable 参数恰好同步一次；测试同时覆盖 embedding、blocks、final norm 和 head。NCCL 多 group 的创建/异步等待次序参考 [PyTorch2.8 官方分布式文档](https://docs.pytorch.org/docs/2.8/distributed.html#groups)；没有引入新库或 CPU fallback。
 - Profiler version3 的 parallel identity 对非对称布局增加 `pipeline_lengths`，pp_size 表示最大深度，rank 上界使用真实 worker 总数；每条 trace 按自身 pipeline 深度检查 stage 与 FIFO/warmup/steady/cooldown。对称 profile 继续使用原对称字段。Eq.11 使用每 pipeline 的真实深度、micro-batch 数和实测 operation scopes；Eq.10 取最大 pipeline 时间。非对称路径不使用 Eq.9 的对称假设；另保留各 pipeline 实测完成时间和包含 P2P/SUM/AdamW 的实际训练时间。
@@ -1015,7 +1015,7 @@ python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_ki
 
 - 已完整阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task13、Task12恢复合同及现有 Planner/Estimator/Restorer/Runtime。仓库修改前干净，未发现仓库级额外 `AGENTS.md`；没有安装、升级或修改依赖与环境。
 - 新增 `tests/e2e/test_kill_adaptive_policy.py`，严格固定 CPU DP3/PP2、6 workers 与 GPU DP4/PP2、8 workers。每个 short/long case 都从相同 seed、worker identity、generation、对称 topology 独立启动，真实训练3个已提交step，在无在途通信的safe point实际 `Process.kill()` stage worker并 `join()`核对非零exitcode，再由harness显式提交 `FailureEvent`。两个case要求相同 `recovery_id` 和候选plan IDs，不复用已恢复runtime。
-- 候选与选择走现有唯一算法路径：真实 `DecisionCenter.evaluate_candidates()` 调用 Estimator、Algorithm1 Planner、Restorer/Hungarian/DSATUR生成rerouting与dynamic manifest，再由 `select_policy()`执行Equation8；没有force-policy、min-step fallback或手工替换winner。受控profile保留正式schema和模型/device identity，将stage compute与精确tensor-size transfer输入设置成明确的功能测试trade-off，并在每个候选derivation标记“controlled Task13 functional profile; not a measured performance claim”。dynamic post-recovery step严格更小，测试独立按 `D*=t_transition/(1-t_dynamic/t_rerouting)` 求break-even；short D位于transition与D*之间，long D严格大于D*。
+- 候选与选择走现有唯一算法路径：`DecisionCenter.select()` 内部调用 Estimator、Algorithm1 Planner、Restorer/Hungarian/DSATUR生成rerouting与dynamic manifest并执行Equation8；没有force-policy、min-step fallback或手工替换winner。受控profile保留正式schema和模型/device identity，将stage compute与精确tensor-size transfer输入设置成明确的功能测试trade-off，并在每个候选derivation标记“controlled Task13 functional profile; not a measured performance claim”。dynamic post-recovery step严格更小，测试独立按 `D*=t_transition/(1-t_dynamic/t_rerouting)` 求break-even；short D位于transition与D*之间，long D严格大于D*。
 - 两条实际恢复路径均进入现有 `Runtime.recover()`：short必须提交 `ReroutingTopology`、保持原layout/逻辑slot并由健康同stage peer在真实续训trace中执行失败pipeline的额外任务；long必须提交布局改变的 `DynamicTopology`，并以真实P2P sends/receives及migration bytes核对选中manifest。两者恢复后各继续2 steps；独立single-process reference仅在两次runtime均关闭后创建，不进入controller/Restorer，逐step核对sample IDs、global loss、全部gradient/parameter以及AdamW step/exp_avg/exp_avg_sq和owner数，committed step必须为3→5。
 - 扩充恢复审计而不改变恢复语义：`Runtime.recover()`复用已验证的survivor `StateSourceMap`，报告新增逐module `state_sources`、safe-point `source_hashes` 和已提交的 `actual_topology`；既有decision记录继续包含B/D/t_step/t_transition/score/selected policy，实际group rebuild、transfer validation和training-group install耗时继续使用明确的 `actual_*` 字段。
 - 审阅收敛后，测试保存每个case首次kill前的 `inspect_state()`：两个独立case必须具有完全相同的safe-point hash；报告中的survivor hash必须逐worker、tensor key、digest与现场状态相等，且覆盖 `state_sources` 中每个module所需tensor。rerouting目标hash必须与源hash完全一致；dynamic每条manifest action及P2P send/receive digest必须等于相应现场source digest。测试还从落盘runtime JSON重新核对完整audit、decision、source map、hash、actual topology、estimated/actual timing及所有清理字段。删除了额外profile marker、结果中的 `selection_profile` 和未使用fixture字段；production恢复逻辑未因本轮收敛改变。
@@ -1087,7 +1087,7 @@ python -m pytest tests/e2e/test_consecutive_kills.py tests/e2e/test_unrecoverabl
 - 已完整阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task15 及 Task13/14 的现有验收路径。修改前工作区干净；未安装、升级或降级任何依赖，未访问目标服务器。
 - 新增 `python -m chameleon profile|train|recover-demo` 及 package console entry point；提供 `configs/tiny_cpu.json` 的真实 4-worker Gloo 配置和 `configs/tiny_8gpu.json` 的真实 8-GPU/NCCL 配置。CLI 严格验证版本化 JSON、完整模型 stage 分区、device/backend/world size、相对路径及确定性模型合同。`recover-demo` 要求调用方显式传 `--inter-fault-duration-s`，无默认 D、MTBF 预测、force-policy 或 CPU fallback。
 - `PlanCache` 仅缓存 Algorithm 1 的 D 无关 dynamic search；key 绑定 recovery/topology/failure/survivor generation、model/config identity、完整 profile hash、Rdp/Rpp 和 memory capacity。`DecisionCenter.precompute_dynamic()` 接受显式 1..k 故障 `RecoveryState`；cache hit 不重跑 search，事故时 live source map、Hungarian/DSATUR manifest 和 Equation 8 仍每次重新构造。测试覆盖 hit/miss、故障状态/model/config/profile 过期、短/长 D 切换不复用 score/decision。
-- `profile` 执行真实 forward/backward/AdamW 与两进程 P2P/bootstrap calibration；`train` 使用现有 `SymmetricRuntime`；`recover-demo` 真实训练 3 steps、safe-point kill/join、预计算当前 dynamic search、Equation 8 选择、调用现有 `Runtime.recover()` 并续训。CLI JSON 记录 environment/version、seed、sample IDs/count、B/D、candidate times/scores、selected policy、source map、PID/exit code、state hashes、容差、actual topology/times 与 cleanup audit。
+- `profile` 执行真实 forward/backward/AdamW 与两进程 P2P/bootstrap calibration；`train` 使用现有 `DistributedRuntime`；`recover-demo` 真实训练 3 steps、safe-point kill/join、预计算当前 dynamic search、Equation 8 选择、调用现有 `Runtime.recover()` 并续训。CLI JSON 记录 environment/version、seed、sample IDs/count、B/D、candidate times/scores、selected policy、source map、PID/exit code、state hashes、容差、actual topology/times 与 cleanup audit。
 - CPU/GPU runner 共用 `scripts/regression_runner.py` 的唯一 matrix，直接调度现有 01–14 以及 Task15 的 pytest 文件，无第二套恢复逻辑。matrix 在执行前审计所有 integration/distributed/e2e 文件恰好出现一次；CPU 分别调度真实 2/4/5/6/7 worker，GPU 分别调度 1/2/4/5/7/8 device。每阶段保存 JUnit 和完整 log，汇总 JSON 记录命令、退出码、数量、耗时与 `failed_stage`；任何 failure/error/skip 都使整体失败。8-GPU/container preflight 失败会在任何 suite 启动前停止。
 - 为本机 Windows/PyTorch 2.14 `FileStore` 无法解码中文工作目录的已知限制，runner 在 Windows 非 ASCII 工作区中自动创建短命 ASCII junction，仍运行同一仓库文件和相对 artifact 路径，且结束后删除 junction；Linux `/workspace` 直接运行。此适配不更换 FileStore、算法或恢复路径。
 - 首次 CPU runner 在 transfer calibration 阶段发现 Windows Gloo 在同一 TCP endpoint 重复销毁/初始化默认 group 会稳定超时；改为首轮建立默认 group，后续 bootstrap sample 执行真实 `new_group + barrier + destroy_process_group(subgroup)`，既保留真实 communicator/group 启动测量，又不复用已销毁的 rendezvous endpoint。单项复现修正后 1 passed，完整 calibration 回归 42 passed。
@@ -1130,7 +1130,7 @@ python scripts/run_gpu_e2e.py --world-size 8 --backend nccl
 
 ## Task 15 代码审阅修正（2026-09-15）
 
-- 审阅发现 `recover-demo` 在真实 kill 后才填充 cache，却把该搜索当作预故障开销隐藏，可能低估 dynamic transition 并污染 Equation 8。现由 `SymmetricRuntime.preview_recovery_state()` 在 committed safe point、全部 worker 存活时读取一次完整 inventory，构造假设故障状态并完成 dynamic search；真实 kill 后重新读取 live survivors，要求实际与预计算 `recovery_id` 一致，再命中 cache、重建 source map/manifest 并评分。
+- 审阅发现 `recover-demo` 在真实 kill 后才填充 cache，却把该搜索当作预故障开销隐藏，可能低估 dynamic transition 并污染 Equation 8。现由 `DistributedRuntime.preview_recovery_state()` 在 committed safe point、全部 worker 存活时读取一次完整 inventory，构造假设故障状态并完成 dynamic search；真实 kill 后重新读取 live survivors，要求实际与预计算 `recovery_id` 一致，再命中 cache、重建 source map/manifest 并评分。
 - 撤销“首轮默认 group、后续 `new_group`”的混合 bootstrap 计时。当前先建立不计时基线组，每个正式样本均计时 `destroy_process_group + init_process_group + barrier`，各轮使用独立 TCP rendezvous 端口；全部端口均检查无监听且可复用。Windows 真实 2-rank Gloo、两轮重建已通过，不再以改变测量语义规避 endpoint 重用超时。
 - CLI profile 报告现覆盖 warm-up 与 profiling 实际消费的全部 sample IDs；`actual_times_s` 只包含数值秒字段。执行期异常会写 `status: failed`、错误类型/消息以及可用 audit，argparse 参数错误仍保持执行前退出。
 - regression runner 在启动子阶段前记录 `failed_stage`，阶段内部异常不再误报为 preflight；stdout 在产生时同步写日志，不再把完整输出保存在内存。新增测试覆盖部分日志保留和阶段异常归属。
@@ -1151,6 +1151,30 @@ python scripts/run_gpu_e2e.py --world-size 8 --backend nccl
 
 - 本轮 CPU summary 为 `artifacts/test-results/final-cpu-summary.json`，12 个阶段均 `passed=true`、`failed_stage=null`；完整控制台输出为 `artifacts/test-results/final-cpu-console-review.log`。GPU preflight 记录为 `artifacts/test-results/final-cuda-summary.json`。
 - 当前仍不将 Task15 标记为最终完成：Ruff 尚未实际运行，固定 Ubuntu 容器 CPU 与 8-GPU/NCCL 完整矩阵尚未通过。
+
+## 重复逻辑全面收敛（2026-09-15）
+
+- 模型模块顺序与 stage-layout 校验已集中到 `model.py`；CLI、symmetric、dynamic、rerouting topology 均调用同一合同，不再维护端点/blocks 的重复硬编码校验。
+- dynamic plan 到 runtime topology 只通过强制 `state + assignments` 的 `DynamicTopology.from_plan()` 完成；工厂统一校验 profile/config、完整 slot、稳定 worker ID、目标 generation/batch 与 dense rank 映射，恢复路径中的手工 rank 转换已删除。
+- AdamW ownership、字段、step、shape、dtype、device 只由 `state_sources.adamw_inventory()` 判定；profiler 仅聚合该 inventory 的字节数，CLI calibration tensor sizes 也由同一 inventory 派生。
+- 新增 `process_control.py`，集中原子 JSON、进程等待与异常退出、terminate/join/kill、worker/子进程审计和 TCP 端口审计；environment smoke、transfer calibration、runtime close 复用同一有界清理核心，三类带 audit 异常共享同一基类。
+- Equation 8 选择只保留 `DecisionCenter.select(state, profile, inter_fault_duration_s)`；删除独立 selector。runtime 类名全量统一为 `DistributedRuntime`，未保留 alias、wrapper、旧签名或弃用兼容层。
+- 参数/梯度/AdamW 数值断言、worker kill、reply/log hash 转换已集中到公共测试 helper；独立 `ReferenceTrainer` oracle、Topology 多态合同与手算 Equation 8 测试保持独立。
+
+本机实际验收（Windows 11 / Python 3.13.12 / torch 2.14.0+cpu / 0 张可见 GPU）：
+
+| 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| 受影响 unit/integration 组合回归 | 0 | model/dynamic/profiler/Equation 8 相关 125 passed；recovery contracts 31 passed |
+| `python -m pytest tests/unit -q --device cpu` | 0 | 896 passed / 0 failures/errors/skipped |
+| `python scripts/run_cpu_e2e.py` | 0 | 12 stages / 1324 tests / 0 failures/errors/skipped；阶段总耗时 1086.84s |
+| 最终定向回归 | 0 | dynamic/recovery contracts 55 passed；ASCII 工作目录下真实 7-worker planner 5 passed；runtime/environment unit 109 passed；真实 6-worker cleanup 3 passed，audit clean |
+| `python -m compileall -q src tests scripts`；`git diff --check` | 0 / 0 | 语法和差异检查通过 |
+| `python -m ruff check src tests scripts` | 1 | 本机未安装 Ruff（`No module named ruff`）；按要求未自动安装，不记为通过 |
+| `python scripts/run_gpu_e2e.py --world-size 8 --backend nccl` | 1 | preflight 硬失败：需要 8 张真实可见 GPU，实际 0；没有启动 suite 或使用 CPU fallback |
+
+- 全文搜索确认源码、测试、README 和本进度文档中不存在旧 runtime/selector 符号、被替代的 profiler 私有 helper 或 calibration 对 environment 私有 record writer 的遗留调用。
+- CPU 汇总为 `artifacts/test-results/final-cpu-summary.json`；GPU preflight 为 `artifacts/test-results/final-cuda-summary.json`。固定 8-GPU/NCCL 环境仍需执行 GPU runner，当前不声称该项已通过。
 
 ## 每次完成小功能的记录格式
 

@@ -18,6 +18,19 @@ class ParameterInfo:
     nbytes: int
 
 
+def model_module_order(config: ModelConfig) -> tuple[str, ...]:
+    return ("embedding", *(f"blocks.{i}" for i in range(config.num_layers)),
+            "final_norm", "lm_head")
+
+
+def validate_stage_layout(config: ModelConfig, stages) -> tuple[tuple[str, ...], ...]:
+    stages = tuple(tuple(stage) if isinstance(stage, (tuple, list)) else stage for stage in stages)
+    if (not stages or any(not isinstance(stage, tuple) or not stage for stage in stages)
+            or tuple(module for stage in stages for module in stage) != model_module_order(config)):
+        raise ValueError("stages must partition every model module once in model order")
+    return stages
+
+
 def parameter_inventory(model: nn.Module) -> tuple[ParameterInfo, ...]:
     """Use named parameters so endpoint and newly added modules are included."""
     inventory = []

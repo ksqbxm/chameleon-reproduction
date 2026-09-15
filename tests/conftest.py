@@ -1,6 +1,75 @@
 import pytest
 
 
+def _select_candidates(candidates, inter_fault_duration_s):
+    """Exercise the public Equation 8 entry with a controlled evaluator stub."""
+    from chameleon.decision_center import DecisionCenter
+
+    center = object.__new__(DecisionCenter)
+    center.evaluate_candidates = lambda state, profile: tuple(candidates)
+    return center.select(None, None, inter_fault_duration_s)
+
+
+def assert_numerical_step(actual, expected, device, *, fp32=False, owner_counts=None):
+    from collections import Counter
+    import torch
+
+    tolerance = (dict(rtol=1e-4, atol=1e-6) if fp32 else
+                 dict(rtol=1e-7, atol=1e-9) if device == "cuda" else dict(rtol=1e-8, atol=1e-10))
+    assert actual["sample_ids"] == list(expected.sample_ids)
+    assert actual["global_sample_count"] == expected.global_sample_count
+    assert actual["step_id"] == expected.committed_global_step
+    assert actual["loss_global_sum"] == pytest.approx(expected.loss_global_sum,
+                                                     rel=tolerance["rtol"], abs=tolerance["atol"])
+    owners = Counter()
+    for report, snapshot in zip(actual["reports"], actual["snapshots"]):
+        assert set(snapshot) == {"parameters", "gradients", "optimizer_state"}
+        assert snapshot["parameters"].keys() == snapshot["gradients"].keys() == snapshot["optimizer_state"].keys()
+        assert set(report["synchronized_parameters"]) == snapshot["parameters"].keys()
+        for name, parameter in snapshot["parameters"].items():
+            owners[name] += 1
+            torch.testing.assert_close(parameter, expected.parameters[name], **tolerance,
+                                       msg=lambda message: f"step {actual['step_id']}, {name}, parameter: {message}")
+            torch.testing.assert_close(snapshot["gradients"][name], expected.gradients[name], **tolerance,
+                                       msg=lambda message: f"step {actual['step_id']}, {name}, gradient: {message}")
+            state = snapshot["optimizer_state"][name]
+            assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
+            for field, value in state.items():
+                torch.testing.assert_close(value, expected.optimizer_state[name][field], **tolerance,
+                                           msg=lambda message: f"step {actual['step_id']}, {name}, AdamW.{field}: {message}")
+    dp_size = len({report["pipeline"] for report in actual["reports"]})
+    assert owners == Counter(owner_counts if owner_counts is not None else
+                             {name: dp_size for name in expected.parameters})
+    assert {name.split(".")[0] for name in owners} == {"embedding", "blocks", "final_norm", "lm_head"}
+
+
+def _kill_workers(runtime, ranks, *, timeout_s=10):
+    from chameleon.contracts import FailureEvent
+
+    ranks = tuple(ranks)
+    workers = tuple(runtime.topology.ranks[rank] for rank in ranks)
+    audit = []
+    for rank in ranks:
+        process = runtime.processes[rank]
+        process.kill()
+        process.join(timeout_s)
+        assert not process.is_alive() and process.exitcode not in (None, 0)
+        audit.append(dict(worker_id=runtime.topology.ranks[rank].worker_id, pid=process.pid,
+                          exitcode=process.exitcode))
+    return (FailureEvent(tuple(worker.worker_id for worker in workers), runtime.state.generation,
+                         runtime.state.committed_global_step), tuple(audit))
+
+
+def _reply_hashes(replies):
+    return {row["worker"].worker_id: {tuple(item["key"]): item["digest"] for item in row["hashes"]}
+            for row in replies}
+
+
+def _logged_hashes(rows):
+    return {row["worker"]["worker_id"]: {tuple(item["key"]): item["digest"] for item in row["hashes"]}
+            for row in rows}
+
+
 def pytest_addoption(parser):
     parser.addoption("--device", choices=("cpu", "cuda"), default="cpu")
     parser.addoption("--world-size", type=int, default=None,
@@ -81,7 +150,7 @@ def symmetric_training(request):
     from chameleon.environment import environment_report, validate_container
     from chameleon.model import build_initial_model
     from chameleon.reference import ReferenceTrainer
-    from chameleon.runtime import SymmetricRuntime, SymmetricTopology
+    from chameleon.runtime import DistributedRuntime, SymmetricTopology
 
     device = request.config.getoption("--device")
     if _world_size(request.config) != 4:
@@ -93,7 +162,7 @@ def symmetric_training(request):
     workers = tuple(WorkerIdentity(f"stable-{20 - rank}", rank, 2) for rank in reversed(range(4)))
     topology = SymmetricTopology(ClusterState(workers, 11, generation=2), config,
                                 (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head")))
-    runtime = SymmetricRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
+    runtime = DistributedRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
     with runtime:
         steps = []
         for step in range(3):
@@ -129,7 +198,7 @@ def asymmetric_training(request):
     from chameleon.environment import environment_report, validate_container
     from chameleon.model import build_initial_model
     from chameleon.reference import ReferenceTrainer
-    from chameleon.runtime import DynamicTopology, SymmetricRuntime
+    from chameleon.runtime import DistributedRuntime, DynamicTopology
 
     device = request.config.getoption("--device")
     size = 8 if device == "cuda" else 7
@@ -145,7 +214,7 @@ def asymmetric_training(request):
     layouts = (short, long, other_long) if device == "cuda" else (short, short, long)
     workers = tuple(WorkerIdentity(f"asymmetric-{20 - r}", r, 2) for r in reversed(range(size)))
     topology = DynamicTopology(ClusterState(workers, 19, generation=2), config, layouts, (5, 3, 2))
-    runtime = SymmetricRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
+    runtime = DistributedRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
     with runtime:
         steps = [runtime.train_step() for _ in range(3)]
         profiles = runtime.snapshot_profiles()
@@ -168,7 +237,7 @@ def rerouted_run(request):
     from chameleon.environment import environment_report, validate_container, validate_device
     from chameleon.model import build_initial_model
     from chameleon.reference import ReferenceTrainer
-    from chameleon.runtime import ReroutingTopology, SymmetricRuntime
+    from chameleon.runtime import DistributedRuntime, ReroutingTopology
 
     device = request.config.getoption("--device")
     size = _world_size(request.config)
@@ -182,7 +251,7 @@ def rerouted_run(request):
         stages = stages or (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head"))
         workers = tuple(WorkerIdentity(f"peer-{20 - r}", r, 2) for r in reversed(range(size)))
         topology = ReroutingTopology(ClusterState(workers, batch, generation=2), config, stages, counts, slots)
-        runtime = SymmetricRuntime(topology, device=device, dtype=dtype, capture_state=True, lr=.007, weight_decay=.125)
+        runtime = DistributedRuntime(topology, device=device, dtype=dtype, capture_state=True, lr=.007, weight_decay=.125)
         with runtime:
             steps = [runtime.train_step() for _ in range(3)]
             assert all(process.is_alive() for process in runtime.processes)
@@ -383,7 +452,7 @@ def recovery_setup(request):
 def _recovery_decision(recovery_state, profile):
     """Both real candidates, measured compute, and explicitly controlled dynamic transition."""
     from dataclasses import replace
-    from chameleon.decision_center import DecisionCenter, select_policy
+    from chameleon.decision_center import DecisionCenter
     from chameleon.restorer import MigrationManifest, TransitionEstimate
     from chameleon.contracts import ModelConfig
     config = ModelConfig(vocab_size=7, hidden_size=4, num_layers=2, num_heads=1,
@@ -398,20 +467,9 @@ def _recovery_decision(recovery_state, profile):
                                     manifest.manifest_id)
     dynamic = replace(dynamic, transition=transition, reasons=(),
                       derivation=dict(dynamic.derivation, transition_source="controlled Task12 selection fixture"))
-    decision = select_policy((rerouting, dynamic), inter_fault_duration_s=100.)
+    decision = _select_candidates((rerouting, dynamic), 100.)
     assert decision.plan.policy == "dynamic"
     return decision
-
-
-def _kill_at_safe_point(runtime, ranks):
-    from chameleon.contracts import FailureEvent
-    for rank in ranks:
-        process = runtime.processes[rank]
-        process.kill()
-        process.join(5)
-        assert not process.is_alive() and process.exitcode not in (None, 0)
-    return FailureEvent(tuple(runtime.topology.ranks[r].worker_id for r in ranks),
-                        runtime.state.generation, runtime.state.committed_global_step)
 
 
 @pytest.fixture(scope="module")
@@ -420,15 +478,15 @@ def recovered_training(request, recovery_setup):
     from chameleon import ClusterState, WorkerIdentity
     from chameleon.model import build_initial_model
     from chameleon.reference import ReferenceTrainer
-    from chameleon.runtime import SymmetricRuntime
+    from chameleon.runtime import DistributedRuntime
 
     topology, profile, device = recovery_setup
-    runtime = SymmetricRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
+    runtime = DistributedRuntime(topology, device=device, capture_state=True, lr=.007, weight_decay=.125)
     with patch("chameleon.runtime._runtime_worker", _guarded_recovery_worker), runtime:
         original = list(runtime.ready)
         steps = [runtime.train_step() for _ in range(3)]
         before = runtime.inspect_state()
-        failure = _kill_at_safe_point(runtime, (1,))
+        failure, _ = _kill_workers(runtime, (1,), timeout_s=5)
         decision = _recovery_decision(runtime.recovery_state(failure), profile)
         recovered = runtime.recover(failure, decision)
         assert runtime.state.committed_global_step == 3
@@ -447,19 +505,19 @@ def recovery_failure(request, recovery_setup):
     from functools import partial
     from unittest.mock import patch
     from chameleon.contracts import UnrecoverableStateError
-    from chameleon.runtime import RuntimeErrorWithAudit, SymmetricRuntime
+    from chameleon.runtime import DistributedRuntime, RuntimeErrorWithAudit
 
     topology, profile, device = recovery_setup
     def run(fault):
         worker = partial(_guarded_recovery_worker, fault=fault)
-        runtime = SymmetricRuntime(topology, device=device, lr=.007, weight_decay=.125)
+        runtime = DistributedRuntime(topology, device=device, lr=.007, weight_decay=.125)
         expectation_failure = None
         try:
             with patch("chameleon.runtime._runtime_worker", worker), runtime:
                 for _ in range(3):
                     runtime.train_step()
                 runtime.inspect_state()
-                failure = _kill_at_safe_point(runtime, (1,))
+                failure, _ = _kill_workers(runtime, (1,), timeout_s=5)
                 try:
                     if fault == "missing_endpoint_source":
                         with pytest.raises(UnrecoverableStateError, match="lm_head"):

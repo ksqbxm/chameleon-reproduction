@@ -47,6 +47,29 @@ def test_complete_inventory(model, torch_module):
     assert {p.module_id for p in updated if p.name.startswith("extra.")} == {"extra"}
 
 
+def test_cli_and_all_topologies_share_the_model_stage_layout_contract(monkeypatch):
+    from chameleon import cli, model
+    from chameleon.runtime import DynamicTopology, ReroutingTopology, SymmetricTopology
+
+    config = ModelConfig(num_layers=2, global_batch_size=4, micro_batch_size=2)
+    stages = (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head"))
+    workers = (WorkerIdentity("layout-0", 0, 0), WorkerIdentity("layout-1", 1, 0))
+    state = ClusterState(workers, config.global_batch_size)
+    assert cli.validate_stage_layout is model.validate_stage_layout
+    calls = []
+    validate = model.validate_stage_layout
+
+    def record(config_value, stages_value):
+        calls.append(stages_value)
+        return validate(config_value, stages_value)
+
+    monkeypatch.setattr(model, "validate_stage_layout", record)
+    SymmetricTopology(state, config, stages)
+    DynamicTopology(state, config, (stages,), (2,))
+    ReroutingTopology(state, config, stages, (2,), ((0, 1),))
+    assert calls == [stages, stages, stages]
+
+
 def test_training_forward_is_deterministic_and_causal(model, torch_module, device):
     torch = torch_module
     model.train()

@@ -5,26 +5,9 @@ from dataclasses import asdict
 import pytest
 
 from chameleon import ClusterState, ModelConfig, UnrecoverableStateError, WorkerIdentity
-from chameleon.contracts import FailureEvent
-from chameleon.decision_center import DecisionCenter, select_policy
-from chameleon.runtime import ReroutingTopology, SymmetricRuntime, SymmetricTopology
+from chameleon.decision_center import DecisionCenter
+from chameleon.runtime import DistributedRuntime, ReroutingTopology, SymmetricTopology
 from chameleon.state_sources import ADAMW_FIELDS, build_state_source_map
-
-
-def _hashes(replies):
-    return {row["worker"].worker_id: {tuple(item["key"]): item["digest"]
-                                      for item in row["hashes"]}
-            for row in replies}
-
-
-def _kill_next_owner(runtime, stage):
-    rank = next(row[stage] for row in runtime.topology.pipeline_ranks if row[stage] is not None)
-    worker, process = runtime.topology.ranks[rank], runtime.processes[rank]
-    process.kill()
-    process.join(10)
-    assert not process.is_alive() and process.exitcode not in (None, 0)
-    return FailureEvent((worker.worker_id,), runtime.state.generation,
-                        runtime.state.committed_global_step), worker.worker_id, process.pid
 
 
 @pytest.fixture(scope="module")
@@ -55,7 +38,7 @@ def unrecoverable_environment(request):
 def test_last_parameter_and_adamw_replica_loss_is_unrecoverable(
         target_parameter, stage, lost_modules, unrecoverable_environment, request):
     from unittest.mock import patch
-    from conftest import _guarded_recovery_worker
+    from conftest import _guarded_recovery_worker, _kill_workers, _reply_hashes, _select_candidates
 
     device, size, config, profile = unrecoverable_environment
     dp = size // 2
@@ -66,7 +49,7 @@ def test_last_parameter_and_adamw_replica_loss_is_unrecoverable(
     workers = tuple(WorkerIdentity(f"last-{generation}-{rank:02d}", rank, generation)
                     for rank in range(size))
     initial = SymmetricTopology(ClusterState(workers, 23, generation=generation), config, stages)
-    runtime = SymmetricRuntime(initial, device=device, lr=.007, weight_decay=.125)
+    runtime = DistributedRuntime(initial, device=device, lr=.007, weight_decay=.125)
     killed_ids, killed_pids, decisions, recoveries = [], [], [], []
     error = None
     try:
@@ -75,7 +58,7 @@ def test_last_parameter_and_adamw_replica_loss_is_unrecoverable(
             for _ in range(3):
                 runtime.train_step()
             baseline_replies = runtime.inspect_state()
-            baseline_hashes = _hashes(baseline_replies)
+            baseline_hashes = _reply_hashes(baseline_replies)
             required = runtime._required
             expected_names = {name for row in runtime.ready for name in row["parameter_names"]}
             assert {tensor.parameter_name for tensor in required} == expected_names
@@ -88,7 +71,10 @@ def test_last_parameter_and_adamw_replica_loss_is_unrecoverable(
                 topology_before = runtime.topology
                 state_before = runtime.state
                 recovery_count = len(runtime.recoveries)
-                failure, worker_id, pid = _kill_next_owner(runtime, stage)
+                rank = next(row[stage] for row in runtime.topology.pipeline_ranks
+                            if row[stage] is not None)
+                failure, kill_audit = _kill_workers(runtime, (rank,))
+                worker_id, pid = kill_audit[0]["worker_id"], kill_audit[0]["pid"]
                 killed_ids.append(worker_id)
                 killed_pids.append(pid)
                 if loss_index == dp - 1:
@@ -110,7 +96,7 @@ def test_last_parameter_and_adamw_replica_loss_is_unrecoverable(
                 center = DecisionCenter(config, expected_identity=profile["identity"],
                                         r_dp=(dp,), r_pp=(1, 2), memory_capacity_bytes=10**15)
                 candidates = center.evaluate_candidates(recovery_state, profile)
-                decision = select_policy(candidates, inter_fault_duration_s=1.)
+                decision = _select_candidates(candidates, 1.)
                 assert decision.plan.policy == "rerouting"
                 decisions.append(decision)
                 recoveries.append(runtime.recover(failure, decision))
@@ -118,7 +104,7 @@ def test_last_parameter_and_adamw_replica_loss_is_unrecoverable(
                 assert runtime.state.committed_global_step == 3
                 live = runtime.inspect_state()
                 assert all(row["step"] == 3 for reply in live for row in reply["parameter_steps"])
-                live_hashes = _hashes(live)
+                live_hashes = _reply_hashes(live)
                 for reply in live:
                     worker = reply["worker"].worker_id
                     if (target_parameter, "parameter") in live_hashes[worker]:

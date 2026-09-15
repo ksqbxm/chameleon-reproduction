@@ -4,10 +4,10 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 
 from .coloring import conflict_graph, dsatur
-from .contracts import WorkerIdentity, _finite, _integer
+from .contracts import WorkerIdentity, _finite, _integer, stable_hash
 from .hungarian import hungarian
 from .planner import DynamicPlan
-from .profiler import _hash, validate_snapshot
+from .profiler import validate_snapshot
 from .state_sources import StateSourceMap, StateTensor
 from .transfer_calibration import calibration_times_s
 
@@ -130,7 +130,7 @@ class Restorer:
     def __init__(self, profile: dict, *, expected_identity: dict):
         validate_snapshot(profile, expected_identity)
         self._profile = deepcopy(profile)
-        self._profile_hash = _hash(self._profile)
+        self._profile_hash = stable_hash(self._profile)
         self._transfer_times = {}
         self._bootstrap_time = None
         for report in self._profile["calibrations"]:
@@ -184,7 +184,7 @@ class Restorer:
         target_state = {(a.destination, a.tensor) for a in actions}
         release = tuple(pair for pair in held if pair not in target_state)
         assert matching.total_cost == sum(a.tensor.nbytes for a in actions if not a.retained)
-        manifest_id = "migration-" + _hash({"plan_id": dynamic.plan_id,
+        manifest_id = "migration-" + stable_hash({"plan_id": dynamic.plan_id,
                                           "committed_global_step": state.committed_global_step,
                                           "actions": tuple(asdict(action) for action in actions)})
         return MigrationManifest(manifest_id, dynamic, assignments, costs, matching.total_cost, tuple(actions),

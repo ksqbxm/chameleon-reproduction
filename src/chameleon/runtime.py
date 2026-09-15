@@ -1007,12 +1007,12 @@ class SymmetricRuntime:
             new_state = ClusterState(new_workers, self.state.global_batch_size, self.state.generation + 1,
                                      self.state.committed_global_step)
             dense = {w.worker_id: w.rank for w in new_workers}
+            sources = build_state_source_map(recovery.survivor_state, self._required, recovery.inventories)
             manifest = execution if isinstance(execution, MigrationManifest) else None
             if manifest is not None:
                 if (manifest.plan.time.derivation["profile_identity"]["config_hash"]
                         != _hash(asdict(self.topology.config))):
                     raise ValueError("dynamic recovery model config must match the plan profile")
-                sources = build_state_source_map(recovery.survivor_state, self._required, recovery.inventories)
                 validate_manifest(manifest, sources)
                 locations = {(slot.pipeline, slot.stage): dense[w.worker_id] for slot, w in manifest.assignments}
                 pipeline_ranks = tuple(tuple(locations[p, s] for s in range(length))
@@ -1097,6 +1097,14 @@ class SymmetricRuntime:
                 generation=new_state.generation, committed_global_step=new_state.committed_global_step,
                 killed=[dict(pid=p.pid, exitcode=p.exitcode, alive=p.is_alive()) for p in retired],
                 joined=joined, targets=moved, staged=staged, installed=installed,
+                state_sources=[dict(module_id=module,
+                                    worker_ids=[worker.worker_id for worker in workers])
+                               for module, workers in sources.module_sources],
+                source_hashes=[dict(worker=asdict(row["worker"]), hashes=row["hashes"])
+                               for row in inspected],
+                actual_topology=dict(policy=decision.plan.policy, workers=[asdict(w) for w in new_workers],
+                                     layouts=target.layouts, pipeline_ranks=target.pipeline_ranks,
+                                     pipeline_micro_batches=target.pipeline_micro_batches),
                 actual_group_rebuild_s=joined_s - began, actual_transfer_validation_s=validated_s - joined_s,
                 actual_training_group_install_s=time.monotonic() - validated_s,
                 source_release_after_all_target_acks=True)

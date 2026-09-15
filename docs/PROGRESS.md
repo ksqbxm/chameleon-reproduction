@@ -1009,6 +1009,40 @@ python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_ki
 - 本次跟踪文件修改范围：`src/chameleon/recovery.py`、`tests/integration/test_restorer_inventory.py`、`tests/conftest.py` 与本进度文件。生成的JUnit位于 `artifacts/test-results/task12-adamw-{minimal|rebuild|contracts|faults|cpu|unit}.xml` 及distributed CPU矩阵对应文件。
 - 目标服务器必须依次重跑：最小成功恢复、重建回归、三个故障case、Task12完整CPU、按2/4/5/7 workers分片的distributed/e2e CPU矩阵、按2/4/5/7/8 GPUs分片且带 `--require-gpu` 的CUDA矩阵，最后全量unit。只有真实CPU/GPU命令全部零失败/错误且audit满足新旧拓扑、状态hash、PID/device、source lifetime和资源清理断言后，才能标记Task12完成。
 
+## Task 13 单故障 adaptive kill E2E 实现（2026-09-15）
+
+- 已完整阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task13、Task12恢复合同及现有 Planner/Estimator/Restorer/Runtime。仓库修改前干净，未发现仓库级额外 `AGENTS.md`；没有安装、升级或修改依赖与环境。
+- 新增 `tests/e2e/test_kill_adaptive_policy.py`，严格固定 CPU DP3/PP2、6 workers 与 GPU DP4/PP2、8 workers。每个 short/long case 都从相同 seed、worker identity、generation、对称 topology 独立启动，真实训练3个已提交step，在无在途通信的safe point实际 `Process.kill()` stage worker并 `join()`核对非零exitcode，再由harness显式提交 `FailureEvent`。两个case要求相同 `recovery_id` 和候选plan IDs，不复用已恢复runtime。
+- 候选与选择走现有唯一算法路径：真实 `DecisionCenter.evaluate_candidates()` 调用 Estimator、Algorithm1 Planner、Restorer/Hungarian/DSATUR生成rerouting与dynamic manifest，再由 `select_policy()`执行Equation8；没有force-policy、min-step fallback或手工替换winner。受控profile保留正式schema和模型/device identity，将stage compute与精确tensor-size transfer输入设置成明确的功能测试trade-off，并在每个候选derivation标记“controlled Task13 functional profile; not a measured performance claim”。dynamic post-recovery step严格更小，测试独立按 `D*=t_transition/(1-t_dynamic/t_rerouting)` 求break-even；short D位于transition与D*之间，long D严格大于D*。
+- 两条实际恢复路径均进入现有 `Runtime.recover()`：short必须提交 `ReroutingTopology`、保持原layout/逻辑slot并由健康同stage peer在真实续训trace中执行失败pipeline的额外任务；long必须提交布局改变的 `DynamicTopology`，并以真实P2P sends/receives及migration bytes核对选中manifest。两者恢复后各继续2 steps；独立single-process reference仅在两次runtime均关闭后创建，不进入controller/Restorer，逐step核对sample IDs、global loss、全部gradient/parameter以及AdamW step/exp_avg/exp_avg_sq和owner数，committed step必须为3→5。
+- 扩充恢复审计而不改变恢复语义：`Runtime.recover()`复用已验证的survivor `StateSourceMap`，报告新增逐module `state_sources`、safe-point `source_hashes` 和已提交的 `actual_topology`；既有decision记录继续包含B/D/t_step/t_transition/score/selected policy，实际group rebuild、transfer validation和training-group install耗时继续使用明确的 `actual_*` 字段。
+- 审阅收敛后，测试保存每个case首次kill前的 `inspect_state()`：两个独立case必须具有完全相同的safe-point hash；报告中的survivor hash必须逐worker、tensor key、digest与现场状态相等，且覆盖 `state_sources` 中每个module所需tensor。rerouting目标hash必须与源hash完全一致；dynamic每条manifest action及P2P send/receive digest必须等于相应现场source digest。测试还从落盘runtime JSON重新核对完整audit、decision、source map、hash、actual topology、estimated/actual timing及所有清理字段。删除了额外profile marker、结果中的 `selection_profile` 和未使用fixture字段；production恢复逻辑未因本轮收敛改变。
+
+实际结果（本机 Windows / Python3.13.12 / pytest9.1.1 / torch2.14.0+cpu，0张可见GPU；未连接目标服务器）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| Task13首次 `--collect-only` | 1 | 新文件单独执行时错误依赖另一测试模块的加载顺序；`ModuleNotFoundError: test_symmetric_training`，未收集测试 |
+| 将完整数值oracle收敛到Task13文件后，`python -m pytest tests/e2e/test_kill_adaptive_policy.py --collect-only -q --device cpu --world-size 6` | 0 | 4 tests collected；只证明独立发现成功，不代表训练验收 |
+| `python -m pytest tests/unit/test_policy_selector.py tests/integration/test_decision_center_oracle.py tests/integration/test_recovery_contracts.py -q --device cpu --world-size 4 --tb=short` | 0 | 139 passed / 0 failures/errors/skipped，包含Equation8、真实算法候选及metadata kill/recovery协议回归 |
+| 受控profile正式schema检查 | 0 | 同步更新module timing、operation trace与step timing后，`validate_snapshot()`通过；精确tensor-size calibration有效，受控输入说明仅保留在candidate derivation中 |
+| Task13指定CPU：`python -m pytest tests/e2e/test_kill_adaptive_policy.py -q --device cpu --world-size 6` | 1 | 4 setup errors；Windows/torch FileStore将工作区中文路径解码为乱码并报 `DistStoreError: No such file or directory`，未进入训练或故障注入 |
+| 诊断性CPU：从纯ASCII可写目录执行同一测试文件，`--device cpu --world-size 6` | 0 | 4 passed / 0 failures/errors/skipped；真实6-worker Gloo、3步训练、两次kill、rerouting/dynamic恢复、P2P、2步续训、reference数值比较、落盘JSON与cleanup断言全部通过 |
+| 诊断性CPU生成的两份成功runtime JSON人工复核 | 0 | rerouting/dynamic均step=5、generation=14、5个survivor hash源、5个module source条目、kill exit=-15、实际三段耗时为正；无leak、所有FileStore已移除、audit clean |
+| Task13指定GPU：`python -m pytest tests/e2e/test_kill_adaptive_policy.py -q --device cuda --world-size 8 --require-gpu` | 1 | pytest配置阶段硬失败：需要8张真实可见GPU、实际为0；没有skip或CPU fallback |
+| Task12使用的17文件相关回归，排除唯一live torch profile case | 0 | 899 passed / 1 deselected / 0 failures/errors/skipped；完整命令沿用Task12审阅节，包含30项恢复合同及DecisionCenter/Planner/Estimator/Restorer/runtime合同 |
+| `python -m compileall -q src tests`；`git diff --check`；最终差异复核 | 0 | 语法与diff检查通过；仅修改Task13直接相关runtime审计、新E2E及本进度文件 |
+
+- 纯ASCII目录的诊断运行产生并人工复核了两份成功runtime JSON，但规定的项目工作目录CPU命令仍受本机Windows/torch Unicode FileStore限制，且本机没有8张GPU；诊断结果不能替代固定容器的两条零failure/error/skip验收。Task13当前为实现、合同回归与本机CPU真实路径验证完成，必需的固定容器CPU/GPU验收待执行，因此按总计划不能标记完成。
+- 固定容器验收入口（项目工作目录内使用既有python，不安装或修改环境）：
+
+```bash
+python -m pytest tests/e2e/test_kill_adaptive_policy.py -q --device cpu --world-size 6 --junitxml=artifacts/test-results/task13-server-cpu.xml
+python -m pytest tests/e2e/test_kill_adaptive_policy.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/task13-server-gpu.xml
+```
+
+服务器需回传两份JUnit、完整终端输出及两条case生成的runtime JSON；只有CPU与8-GPU命令均零failure/error/skip，且报告中的policy、state/hash、PID、topology、实际耗时和cleanup断言全部通过后，才能确认Task13完成并进入Task14。
+
 ## 每次完成小功能的记录格式
 
 - Task / 小功能：

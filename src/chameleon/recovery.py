@@ -112,7 +112,9 @@ def rebuild_stage(structure, modules, old_model, old_optimizer, target_tensors):
                      else torch.nn.Parameter(value, requires_grad=template.requires_grad))
         parent_name, leaf = name.rsplit(".", 1)
         model.get_submodule(parent_name)._parameters[leaf] = parameter
-    optimizer = torch.optim.AdamW(model.parameters(), **old_optimizer.defaults)
+    parameter_group = dict(old_optimizer.param_groups[0])
+    parameter_group["params"] = list(model.parameters())
+    optimizer = torch.optim.AdamW([parameter_group])
     for name, parameter in model.named_parameters():
         optimizer.state[parameter] = {kind: target_tensors[name, kind] for kind in ADAMW_FIELDS[1:]}
     return model, optimizer

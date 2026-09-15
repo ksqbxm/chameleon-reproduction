@@ -374,37 +374,49 @@ def recovery_failure(request, recovery_setup):
     def run(fault):
         worker = partial(_guarded_recovery_worker, fault=fault)
         runtime = SymmetricRuntime(topology, device=device, lr=.007, weight_decay=.125)
+        expectation_failure = None
         try:
             with patch("chameleon.runtime._runtime_worker", worker), runtime:
                 for _ in range(3):
                     runtime.train_step()
                 runtime.inspect_state()
                 failure = _kill_at_safe_point(runtime, (1,))
-                if fault == "missing_endpoint_source":
-                    with pytest.raises(UnrecoverableStateError, match="lm_head"):
-                        runtime.recovery_state(failure)
-                else:
-                    decision = _recovery_decision(runtime.recovery_state(failure), profile)
-                    if fault == "missing_manifest_tensor":
-                        manifest = decision.candidate.execution
-                        broken = replace(manifest, actions=manifest.actions[:-1])
-                        decision = replace(decision, candidate=replace(decision.candidate, execution=broken))
-                    if fault == "group_timeout":
-                        runtime.timeout_s = 5
-                    error = UnrecoverableStateError if fault in ("missing_manifest_tensor", "source_mutation") else RuntimeErrorWithAudit
-                    message = {"missing_manifest_tensor": "manifest lacks complete",
-                               "source_mutation": "survivor state changed",
-                               "transfer_error": "injected state transfer failure", "group_timeout": "hard timeout"}[fault]
-                    with pytest.raises(error, match=message):
-                        runtime.recover(failure, decision)
-                assert runtime.state.generation == topology.state.generation
-                assert runtime.state.committed_global_step == 3
-                assert runtime.topology is topology and not runtime.recoveries
+                try:
+                    if fault == "missing_endpoint_source":
+                        with pytest.raises(UnrecoverableStateError, match="lm_head"):
+                            runtime.recovery_state(failure)
+                    else:
+                        decision = _recovery_decision(runtime.recovery_state(failure), profile)
+                        if fault == "missing_manifest_tensor":
+                            manifest = decision.candidate.execution
+                            broken = replace(manifest, actions=manifest.actions[:-1])
+                            decision = replace(decision, candidate=replace(decision.candidate, execution=broken))
+                        if fault == "group_timeout":
+                            runtime.timeout_s = 5
+                        error = UnrecoverableStateError if fault in ("missing_manifest_tensor", "source_mutation") else RuntimeErrorWithAudit
+                        message = {"missing_manifest_tensor": "manifest lacks complete",
+                                   "source_mutation": "survivor state changed",
+                                   "transfer_error": "injected state transfer failure",
+                                   "group_timeout": "runtime staged exceeded hard timeout"}[fault]
+                        with pytest.raises(error, match=message):
+                            runtime.recover(failure, decision)
+                except BaseException as exc:
+                    expectation_failure = exc
+                atomic = dict(generation=runtime.state.generation == topology.state.generation,
+                              committed_step=runtime.state.committed_global_step == 3,
+                              topology=runtime.topology is topology,
+                              no_recovery=not runtime.recoveries)
         finally:
             runtime.close("failure test cleanup")
             if hasattr(runtime, "report_path"):
                 request.config._chameleon_reports.add(runtime.report_path)
-        assert runtime.audit["clean"] and not runtime.audit["leaked_pids"]
-        assert all(not r["alive"] for r in runtime.audit["workers"])
-        assert runtime.audit["rendezvous_removed"]
+        audit = runtime.audit
+        checks = dict(atomic, clean=audit["clean"], no_leaked_pids=not audit["leaked_pids"],
+                      original_workers=len(audit["workers"]) == len(topology.ranks),
+                      workers_stopped=all(not row["alive"] for row in audit["workers"]),
+                      stores_removed=all(row["removed"] for row in audit["rendezvous_files"]),
+                      rendezvous_removed=audit["rendezvous_removed"])
+        assert all(checks.values()), checks
+        if expectation_failure is not None:
+            raise expectation_failure
     return run

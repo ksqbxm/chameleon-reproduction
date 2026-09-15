@@ -983,6 +983,32 @@ python -m pytest tests/distributed/test_full_state_transfer.py tests/e2e/test_ki
 - 日志/报告：`artifacts/test-results/task12-entry-{red|contracts|minimal|suite|unit|recovery-regression}.xml`、同名 `.log`、`task12-entry-gpu.log` 与 `task12-entry-summary.json`。本次恢复合同实际产生8个metadata协议运行，全部clean=True、4个原PID无存活、所有generation store已删除；该结果不代表真实Gloo/NCCL训练或训练清理验收。
 - 未验证项：服务器真实CPU/GPU训练恢复、全部状态hash/P2P/续训数值、异常注入与实际process-group hang/cleanup，以及Task09–11训练回归。当前已修正的是CLI默认规模；服务器应更新本次代码后重跑原命令获取首个实际worker异常。GPU验收仍必须显式加 `--device cuda --world-size 4 --require-gpu`，本机结果不替代服务器验收，Task12状态仍为真实路径待验。
 
+## Task 12 AdamW parameter-group 恢复根因修复（2026-09-15）
+
+- 依据用户提供的 `task12-debug` 诊断归档逐项读取内部 worker traceback 与4份runtime audit；归档仅作为证据，未修改或纳入实现。正常恢复及 `transfer_error`、`source_mutation`、`group_timeout` 均先在 `rebuild_stage()` 触发 `TypeError: AdamW.__init__() got an unexpected keyword argument 'decoupled_weight_decay'`。三个故障注入尚未到达预定故障点，因此不修改或放宽原异常语义。
+- 根因修复限定在 `src/chameleon/recovery.py`：彻底删除将 `old_optimizer.defaults` 展开为AdamW构造参数的旧路径；复制当前唯一parameter group，替换为恢复后的参数列表，并通过AdamW parameter-group接口重建。现有逐参数parameter、step、exp_avg、exp_avg_sq安装保持唯一状态路径；未增加字段过滤、版本分支、反射、fallback或重试。
+- 新增真实PyTorch回归，使用3步完整AdamW状态、与defaults不同的实时group学习率及同时存在的retained/migrated tensor；检查optimizer参数唯一所有权、group配置、对象身份、源hash、step=3 inventory，并将恢复后第4步与独立AdamW状态基准比较。
+- 故障fixture保留原有精确异常类型/消息检查；若检查不匹配，先保存该异常，仍采集旧generation/topology/step、零recovery commit以及PID/FileStore/目录清理结果，全部检查完成后再重新抛出。`group_timeout` 收紧为 `runtime staged exceeded hard timeout`，要求故障确实发生在训练group staging阶段。topology atomicity、hash/state validation、source lifetime、checkpoint guard、cleanup和runtime异常包装均未放宽。
+- 用户归档中的4次提前失败均保持generation 4、committed step 3、`recoveries=[]`、`clean=true`；每次4个原PID均不存活且无leaked PID，初始及generation-5 FileStore和rendezvous目录均已删除。该证据只证明旧构造异常下没有部分提交；修复后的三个预定故障仍须目标服务器重跑。
+
+实际结果（本机Windows / Python3.13.12 / pytest9.1.1，无torch；未安装或修改环境）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m compileall -q src tests`；`git diff --check` | 0 | 语法与diff检查通过 |
+| 原最小成功恢复入口，CPU/4 workers | 1 | 1 setup error：`ModuleNotFoundError: torch`；未启动worker |
+| 新增 `test_rebuild_stage_preserves_live_adamw_group_and_state` | 1 | 1 setup error：缺torch；未执行真实AdamW断言 |
+| `tests/integration/test_recovery_contracts.py tests/unit/test_runtime_contracts.py` | 0 | 76 passed / 0 failures/errors/skipped；metadata控制协议、提交与清理合同通过 |
+| 三个目标故障case，CPU/4 workers | 1 | 3 setup errors / 2 deselected，均缺torch；未到故障注入 |
+| Task12两个验收文件，CPU/4 workers | 1 | 10 setup errors，全部缺torch |
+| 完整distributed CPU固定规模矩阵 | 1 | transfer calibration 39 passed/3 errors；symmetric 12 errors；asymmetric/colored 11 errors；rerouted 12 errors；scale 2 errors；全部error均缺torch |
+| 完整distributed/e2e CUDA固定规模矩阵，均带 `--require-gpu` | 1 | 5组命令均在pytest配置阶段报 `No module named 'torch'`，没有GPU执行或skip/fallback |
+| `python -m pytest tests/unit -q --device cpu --world-size 4` | 1 | 805 passed / 81 errors / 0 failures/skipped；81项均缺torch |
+| `python -m ruff check src/chameleon/recovery.py tests/conftest.py tests/integration/test_restorer_inventory.py` | 1 | 本机未安装ruff；未修改环境，改用compileall和diff检查 |
+
+- 本次跟踪文件修改范围：`src/chameleon/recovery.py`、`tests/integration/test_restorer_inventory.py`、`tests/conftest.py` 与本进度文件。生成的JUnit位于 `artifacts/test-results/task12-adamw-{minimal|rebuild|contracts|faults|cpu|unit}.xml` 及distributed CPU矩阵对应文件。
+- 目标服务器必须依次重跑：最小成功恢复、重建回归、三个故障case、Task12完整CPU、按2/4/5/7 workers分片的distributed/e2e CPU矩阵、按2/4/5/7/8 GPUs分片且带 `--require-gpu` 的CUDA矩阵，最后全量unit。只有真实CPU/GPU命令全部零失败/错误且audit满足新旧拓扑、状态hash、PID/device、source lifetime和资源清理断言后，才能标记Task12完成。
+
 ## 每次完成小功能的记录格式
 
 - Task / 小功能：

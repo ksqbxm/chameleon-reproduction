@@ -5,3 +5,8 @@
 # the declared scientific libraries do not provide a Python build backend.
 # Check availability before building; do not use isolated builds that download it.
 setuptools
+
+# Development-only Task 15 lint command. The required Ruff lint cannot be
+# performed by pytest or the standard library. It is not imported by production
+# code; declaration does not authorize or perform installation in the container.
+ruff

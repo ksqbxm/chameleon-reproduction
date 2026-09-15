@@ -9,6 +9,9 @@ description = "Adaptive fault tolerance for distributed training"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+chameleon = "chameleon.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

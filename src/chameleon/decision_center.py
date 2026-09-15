@@ -10,6 +10,7 @@ from .contracts import (
 )
 from .estimators import Estimator, MemoryEstimate, TimeEstimate, estimate_rerouting_time
 from .planner import DynamicPlan, NoFeasibleDynamicPlanError, Planner
+from .plan_cache import PlanCache
 from .profiler import _hash
 from .restorer import MigrationManifest, MissingTransitionCalibrationError, Restorer, TransitionEstimate
 from .state_sources import StateTensor, WorkerInventory, build_state_source_map
@@ -241,11 +242,45 @@ def select_policy(candidates: tuple[PolicyCandidate, ...], inter_fault_duration_
 
 class DecisionCenter:
     def __init__(self, config: ModelConfig, *, expected_identity: dict, r_dp, r_pp,
-                 memory_capacity_bytes: int):
+                 memory_capacity_bytes: int, plan_cache: PlanCache | None = None):
         self.config = config
         self.expected_identity = deepcopy(expected_identity)
         self.r_dp, self.r_pp = tuple(r_dp), tuple(r_pp)
         self.memory_capacity_bytes = memory_capacity_bytes
+        if plan_cache is not None and not isinstance(plan_cache, PlanCache):
+            raise ValueError("plan_cache must be a PlanCache")
+        self.plan_cache = plan_cache
+
+    def _planner(self, profile):
+        estimator = Estimator(profile, expected_identity=self.expected_identity,
+                              layer_modules=tuple(f"blocks.{i}" for i in range(self.config.num_layers)))
+        planner = Planner(estimator, config=self.config, r_dp=self.r_dp, r_pp=self.r_pp,
+                          memory_capacity_bytes=self.memory_capacity_bytes)
+        return estimator, planner
+
+    def precompute_dynamic(self, states, profile: dict, *, max_failures: int):
+        """Populate D-independent searches for explicit scenarios with 1..k failures."""
+        _integer("max_failures", max_failures)
+        states = tuple(states)
+        if not states:
+            raise ValueError("precompute states must be nonempty")
+        if self.plan_cache is None:
+            raise ValueError("precompute requires a PlanCache")
+        _, planner = self._planner(profile)
+        records = []
+        for state in states:
+            if not isinstance(state, RecoveryState):
+                raise ValueError("precompute states must contain RecoveryState values")
+            failed = len(state.failure.failed_worker_ids)
+            if not 1 <= failed <= max_failures:
+                raise ValueError("precompute scenarios must contain 1..max_failures failed workers")
+            lookup = self.plan_cache.search(planner, state)
+            records.append({"recovery_id": state.recovery_id, "failed_workers": failed,
+                            "cache_key": lookup.key, "cache_hit": lookup.hit,
+                            "feasible": lookup.feasible,
+                            "plan_id": lookup.plan.plan_id if lookup.plan is not None else None,
+                            "reasons": lookup.reasons})
+        return tuple(records)
 
     def _rerouting(self, state, estimator, common_control, source_reasons):
         survivors = state.survivor_state
@@ -322,10 +357,7 @@ class DecisionCenter:
 
     def evaluate_candidates(self, state: RecoveryState, profile: dict) -> tuple[PolicyCandidate, PolicyCandidate]:
         """Evaluate rerouting and Algorithm 1's best dynamic plan independently of D."""
-        estimator = Estimator(profile, expected_identity=self.expected_identity,
-                              layer_modules=tuple(f"blocks.{i}" for i in range(self.config.num_layers)))
-        planner = Planner(estimator, config=self.config, r_dp=self.r_dp, r_pp=self.r_pp,
-                          memory_capacity_bytes=self.memory_capacity_bytes)
+        estimator, planner = self._planner(profile)
         restorer = Restorer(profile, expected_identity=self.expected_identity)
         survivors = state.survivor_state
         if survivors.global_batch_size != self.config.global_batch_size:
@@ -346,23 +378,39 @@ class DecisionCenter:
             source_reasons = (str(error),)
         common = restorer.common_control_time_s
         rerouting = self._rerouting(state, estimator, common, source_reasons)
-        start = perf_counter()
-        try:
-            dynamic = planner.best_dynamic_plan(survivors)
-        except NoFeasibleDynamicPlanError as error:
-            search_time = perf_counter() - start
-            rejected = error.rejected_plan
+        if self.plan_cache is None:
+            start = perf_counter()
+            try:
+                dynamic = planner.best_dynamic_plan(survivors)
+            except NoFeasibleDynamicPlanError as error:
+                search_time = perf_counter() - start
+                dynamic = None
+                rejected, search_reasons = error.rejected_plan, error.reasons
+                cache_record = {"enabled": False, "key": None, "hit": False}
+            else:
+                search_time = perf_counter() - start
+                rejected, search_reasons = None, ()
+                cache_record = {"enabled": False, "key": None, "hit": False}
+        else:
+            start = perf_counter()
+            lookup = self.plan_cache.search(planner, state)
+            dynamic = lookup.plan
+            rejected, search_reasons = lookup.rejected_plan, lookup.reasons
+            search_time = 0. if lookup.hit else perf_counter() - start
+            cache_record = {"enabled": True, "key": lookup.key, "hit": lookup.hit}
+        if dynamic is None:
             plan_id = rejected.plan_id if rejected else "dynamic-unavailable-" + _hash({
                 "recovery": state.recovery_id, "profile": _hash(profile), "Rdp": planner.r_dp,
                 "Rpp": planner.r_pp, "capacity": planner.memory_capacity_bytes})
             candidate = PolicyCandidate(plan_id, "dynamic", survivors.global_batch_size,
                 survivors.generation, None, None, common, rejected.memory if rejected else (), rejected,
-                {"unoverlapped_search_time_s": search_time, "search_rejection_reasons": error.reasons,
-                 "diagnostic_layouts": rejected.layouts if rejected else ()}, source_reasons + error.reasons)
+                {"unoverlapped_search_time_s": search_time, "search_rejection_reasons": search_reasons,
+                 "diagnostic_layouts": rejected.layouts if rejected else (),
+                 "dynamic_search_cache": cache_record}, source_reasons + search_reasons)
             return rerouting, candidate
-        search_time = perf_counter() - start
         derivation = {"time": dynamic.time.derivation, "unoverlapped_search_time_s": search_time,
-                      "search_objective": "Algorithm 1 minimum post-recovery step time; independent of D"}
+                      "search_objective": "Algorithm 1 minimum post-recovery step time; independent of D",
+                      "dynamic_search_cache": cache_record}
         execution, transition, reasons = dynamic, None, source_reasons
         if sources is not None:
             execution = restorer.plan(dynamic, sources)

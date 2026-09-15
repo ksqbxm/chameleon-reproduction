@@ -9,8 +9,9 @@ from .contracts import (
     UnrecoverableStateError,
     WorkerIdentity,
 )
+from .plan_cache import PlanCache
 
 __all__ = [
     "ClusterState", "DecisionResult", "ExecutionPlan", "FailureEvent",
-    "ModelConfig", "UnrecoverableStateError", "WorkerIdentity",
+    "ModelConfig", "PlanCache", "UnrecoverableStateError", "WorkerIdentity",
 ]

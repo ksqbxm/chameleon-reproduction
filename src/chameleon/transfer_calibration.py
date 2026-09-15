@@ -29,8 +29,8 @@ def _validate_sizes(sizes):
         raise ValueError("tensor_bytes must be unique")
 
 
-def _calibration_worker(rank, device, backend, port, directory, sizes, warmup,
-                        iterations, bootstrap_rounds, timeout_s):
+def _calibration_worker(rank, device, backend, ports, directory, sizes, warmup,
+                        iterations, timeout_s):
     import torch
     import torch.distributed as dist
     from .profiler import device_identity
@@ -43,15 +43,21 @@ def _calibration_worker(rank, device, backend, port, directory, sizes, warmup,
         if device == "cuda":
             torch.cuda.set_device(target)
         record["device_identity"] = device_identity(target)
-        for _ in range(bootstrap_rounds):
-            if dist.is_initialized():
-                dist.destroy_process_group()
+        dist.init_process_group(
+            backend, init_method=f"tcp://127.0.0.1:{ports[0]}", rank=rank, world_size=2,
+            timeout=timedelta(seconds=timeout_s),
+        )
+        dist.barrier()
+        if device == "cuda":
+            torch.cuda.synchronize(target)
+        for port in ports[1:]:
             start = time.monotonic()
+            dist.destroy_process_group()
             dist.init_process_group(
                 backend, init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
                 timeout=timedelta(seconds=timeout_s),
             )
-            # Force lazy communicator initialization; init_process_group alone is insufficient for NCCL.
+            # Force lazy communicator initialization; process-group construction alone is insufficient for NCCL.
             dist.barrier()
             if device == "cuda":
                 torch.cuda.synchronize(target)
@@ -111,21 +117,32 @@ def run_transfer_calibration(device: str, world_size: int = 2, *,
     backend = validate_device(device, world_size)
     root = Path(artifact_dir)
     root.mkdir(parents=True, exist_ok=True)
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
+    reservations = []
+    try:
+        for _ in range(bootstrap_rounds + 1):
+            reservation = socket.socket()
+            try:
+                reservation.bind(("127.0.0.1", 0))
+            except BaseException:
+                reservation.close()
+                raise
+            reservations.append(reservation)
+        ports = tuple(reservation.getsockname()[1] for reservation in reservations)
+    finally:
+        for reservation in reservations:
+            reservation.close()
     baseline = {p.pid for p in mp.active_children()}
     context = mp.get_context("spawn")
     processes, records, error = [], [], None
-    audit = {"port": port}
+    audit = {"port": ports[-1]}
     with tempfile.TemporaryDirectory(prefix="calibration-", dir=root) as directory:
         audit["rendezvous_dir"] = directory
         deadline = time.monotonic() + timeout_s
         try:
             for rank in range(2):
                 process = context.Process(target=_calibration_worker,
-                    args=(rank, device, backend, port, directory, tensor_bytes, warmup,
-                          iterations, bootstrap_rounds, timeout_s))
+                    args=(rank, device, backend, ports, directory, tensor_bytes, warmup,
+                          iterations, timeout_s))
                 process.start()
                 processes.append(process)
             while True:
@@ -161,17 +178,21 @@ def run_transfer_calibration(device: str, world_size: int = 2, *,
                 if not process.is_alive():
                     process.close()
     audit["rendezvous_removed"] = not Path(audit["rendezvous_dir"]).exists()
-    with socket.socket() as probe:
-        probe.settimeout(0.2)
-        audit["port_listening"] = probe.connect_ex(("127.0.0.1", port)) == 0
-    with socket.socket() as probe:
-        if os.name != "nt":
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            probe.bind(("127.0.0.1", port))
-            audit["port_reusable"] = True
-        except OSError:
-            audit["port_reusable"] = False
+    listening, reusable = [], []
+    for port in ports:
+        with socket.socket() as probe:
+            probe.settimeout(0.2)
+            listening.append(probe.connect_ex(("127.0.0.1", port)) == 0)
+        with socket.socket() as probe:
+            if os.name != "nt":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+                reusable.append(True)
+            except OSError:
+                reusable.append(False)
+    audit["port_listening"] = any(listening)
+    audit["port_reusable"] = all(reusable)
     audit["clean"] = (not audit["leaked_pids"] and audit["rendezvous_removed"]
                       and not audit["port_listening"] and audit["port_reusable"]
                       and all(not w["alive"] for w in audit["workers"]))

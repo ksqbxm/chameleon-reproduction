@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "device": "cpu",
+  "backend": "gloo",
+  "world_size": 4,
+  "dtype": "float64",
+  "artifact_dir": "artifacts/test-results",
+  "model": {
+    "vocab_size": 7,
+    "hidden_size": 4,
+    "num_layers": 2,
+    "num_heads": 1,
+    "sequence_length": 3,
+    "global_batch_size": 4,
+    "micro_batch_size": 1,
+    "seed": 42,
+    "dropout": 0.0,
+    "amsgrad": false,
+    "paper_path": null
+  },
+  "parallel": {
+    "dp_size": 2,
+    "pp_size": 2,
+    "stage_modules": [
+      ["embedding", "blocks.0"],
+      ["blocks.1", "final_norm", "lm_head"]
+    ],
+    "failure_rank": 0
+  },
+  "training": {
+    "steps": 3,
+    "resume_steps": 1,
+    "lr": 0.007,
+    "weight_decay": 0.125,
+    "timeout_s": 120
+  },
+  "planner": {
+    "r_dp": [1, 2],
+    "r_pp": [1, 2, 3],
+    "memory_capacity_bytes": 1000000000,
+    "max_precompute_failures": 1
+  },
+  "profile": {
+    "steps": 1,
+    "ema_alpha": 0.5,
+    "calibration_warmup": 0,
+    "calibration_iterations": 1,
+    "calibration_bootstrap_rounds": 1
+  }
+}

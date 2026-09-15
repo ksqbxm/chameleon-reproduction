@@ -940,13 +940,16 @@ class SymmetricRuntime:
         return tuple(WorkerInventory(r["worker"], r["step_id"],
                      tuple(StateTensor(**dict(t, shape=tuple(t["shape"]))) for t in r["tensors"])) for r in replies)
 
-    def _failure_ranks(self, failure):
+    def _failed_ranks(self, failure):
         if (not self.ready or self._closed or not isinstance(failure, FailureEvent)
                 or failure.generation != self.state.generation
                 or failure.committed_global_step != self.state.committed_global_step
                 or not set(failure.failed_worker_ids) <= {w.worker_id for w in self.state.workers}):
             raise ValueError("failure must describe the current committed safe point")
-        failed = {w.rank for w in self.topology.ranks if w.worker_id in failure.failed_worker_ids}
+        return {w.rank for w in self.topology.ranks if w.worker_id in failure.failed_worker_ids}
+
+    def _failure_ranks(self, failure):
+        failed = self._failed_ranks(failure)
         for rank, process in enumerate(self.processes):
             process.join(0)
             if rank in failed:
@@ -956,6 +959,19 @@ class SymmetricRuntime:
                 raise ValueError("FailureEvent omits a dead worker")
         return tuple(rank for rank in range(len(self.processes)) if rank not in failed)
 
+    def preview_recovery_state(self, failure):
+        """Build a hypothetical recovery state at a safe point without killing workers."""
+        failed = self._failed_ranks(failure)
+        for process in self.processes:
+            process.join(0)
+            if not process.is_alive():
+                raise ValueError("recovery preview requires every current worker to be alive")
+        inspected = self.inspect_state()
+        ranks = tuple(rank for rank in range(len(self.processes)) if rank not in failed)
+        replies = [inspected[rank] for rank in ranks]
+        recovery, _ = self._build_recovery_state(failure, ranks, replies)
+        return recovery, inspected
+
     def recovery_state(self, failure):
         """External harness submits the failure; only surviving control pipes participate."""
         ranks = self._failure_ranks(failure)
@@ -964,13 +980,18 @@ class SymmetricRuntime:
             return recovery
 
     def _inspect_recovery(self, failure, ranks, deadline):
-        from .decision_center import RecoveryState
-        from .state_sources import build_state_source_map
         if self.state.committed_global_step < 3 or self._required is None:
             raise RuntimeError("recovery requires complete model metadata and at least three committed steps")
         for rank in ranks:
             self.connections[rank].send_bytes(b"inspect")
         replies = self._collect("inspect", deadline, ranks=ranks)
+        return self._build_recovery_state(failure, ranks, replies)
+
+    def _build_recovery_state(self, failure, ranks, replies):
+        from .decision_center import RecoveryState
+        from .state_sources import build_state_source_map
+        if self.state.committed_global_step < 3 or self._required is None:
+            raise RuntimeError("recovery requires complete model metadata and at least three committed steps")
         inventories = self._inventories(replies)
         survivor_state = replace(self.state, workers=tuple(self.topology.ranks[r] for r in ranks))
         build_state_source_map(survivor_state, self._required, inventories)

@@ -1,6 +1,6 @@
 # 项目进度
 
-本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。Task09 的对称分布式训练 runtime 和验收测试已实现，真实 CPU/GPU 训练因本机缺少 torch 待验；Task12 已补齐完整状态迁移与 survivor group 重建实现和验收测试，真实 CPU/GPU 训练恢复与 kill 测试仍待验。
+本文件是唯一进度记录位置。Task 01 的工程骨架、数据合同和环境测试已实现；Task 02 的模型、确定性数据、单进程 reference 和 step commit 已实现；Task 03 的全局 loss/sample accounting、单设备 owner gradient SUM 与一次归一化及对照测试已实现；Task 04 的 Profiler 和校准已实现，服务器回归及双 GPU 状态见下表；Task 05 的 1F1B 依赖、Eq.9–14 估计和 profile 接口已实现，审阅后 161 项算法单测通过，3 项真实 profile 接入因本机缺少 torch 待验；Task 06 的 dynamic Planner、batch/layer search 已实现，审阅后本机 CPU 指定组合 288 passed，固定容器复验待执行；Task 07 的完整 survivor sources、Hungarian 字节匹配、DSATUR 和 Restorer manifest/transition 规划已实现，审阅后指定算法 CPU 组合 135 passed、相关算法回归 584 passed，补充真实 inventory 与字节校准因本机缺 torch 待验。当前 profile 唯一格式为 version 3，旧文件需要重新采样。本机结果不替代固定容器验收。真实 GPU 验收由用户在服务器启动；此前按用户要求重跑本机 CUDA 命令，因缺少 torch 在配置阶段退出。Task09 的对称分布式训练 runtime 和验收测试已实现，真实 CPU/GPU 训练因本机缺少 torch 待验；Task12 已补齐完整状态迁移与 survivor group 重建实现和验收测试；Task 13/14 真实 CPU 路径已通过，GPU 待验。Task 15 的 CLI、D 无关 dynamic search cache、CPU/GPU 统一 runner、配置与 README 已实现，本机完整 CPU runner 1313 passed / 0 skipped；固定容器、8 GPU 和 Ruff 仍待验，因此不标记最终完成。
 
 Task 08 的 Equation8 自适应选择、独立 rerouting candidate 与 Planner/Estimator/Restorer 组合已实现并审阅修正；本机指定 CPU 组合 108 passed，合同及 Task05–08 算法回归 746 passed。固定容器复验待执行；受影响真实 inventory/校准补测为 39 passed / 22 errors（缺 torch），真实训练中的策略切换按总计划在 Task13 验证。
 
@@ -24,7 +24,9 @@ Task 11 的逻辑 stage/物理 rank 分离、同 stage peer 分担、真实 acti
 | 10 | 已实现；同步采用修正后的共用 runtime；合同/算法/profile schema 已验；真实 CPU/GPU 待验 | 最新共用合同68 passed、相关回归871 passed；本次指定CPU组合16 setup errors（缺 torch）；8 GPU未执行 |
 | 11 | 实现与验收测试已编写；路由/审计合同已验；真实 CPU/GPU 待验 | 路由49 passed；相关回归219 passed / 1 deselected；指定CPU组合49 passed / 12 setup errors、7-worker CPU扩展2 setup errors，均缺torch；5/7 GPU未执行 |
 | 12 | 恢复实现及省略worker规模的入口已修正；合同/控制协议已验；真实 CPU/GPU 待验 | 最新入口合同10 passed、恢复/DecisionCenter组合90 passed；全量unit805 passed / 81 errors（缺torch）；真实CPU组合10 setup errors（缺torch），CUDA配置阶段退出4；未执行真实训练/GPU kill |
-| 13-15 | 待实施 | 未执行 |
+| 13 | 实现完成；本机真实 CPU/Gloo 通过；固定容器 CPU/GPU 待验 | 最终 CPU runner 中 4 passed；8 GPU 未执行 |
+| 14 | 实现完成；本机真实 CPU/Gloo 通过；固定容器 CPU/GPU 待验 | 最终 CPU runner 中 11 passed；8 GPU 未执行 |
+| 15 | CLI/cache/runner/文档已实现；本机 CPU 全量通过；Ruff 与固定容器 GPU 待验 | CLI/cache 7 passed；unit 887 passed；CPU runner 1313 passed / 0 skipped；GPU preflight 因 0 GPU 失败；Ruff 未安装 |
 
 GPU 必测未执行时，不得将对应 task 标为完成。
 
@@ -1079,6 +1081,76 @@ python -m pytest tests/e2e/test_consecutive_kills.py tests/e2e/test_unrecoverabl
 ```
 
 服务器需回传两份JUnit、完整终端输出及Task14生成的runtime审计JSON；只有两条命令均零failure/error/skip，且连续generation、Equation8选择、最后副本原子拒绝和资源审计断言全部通过后，才能按总计划确认Task14完成并进入Task15。
+
+## Task 15 CLI、预计算 cache 与最终回归实现（2026-09-15）
+
+- 已完整阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task15 及 Task13/14 的现有验收路径。修改前工作区干净；未安装、升级或降级任何依赖，未访问目标服务器。
+- 新增 `python -m chameleon profile|train|recover-demo` 及 package console entry point；提供 `configs/tiny_cpu.json` 的真实 4-worker Gloo 配置和 `configs/tiny_8gpu.json` 的真实 8-GPU/NCCL 配置。CLI 严格验证版本化 JSON、完整模型 stage 分区、device/backend/world size、相对路径及确定性模型合同。`recover-demo` 要求调用方显式传 `--inter-fault-duration-s`，无默认 D、MTBF 预测、force-policy 或 CPU fallback。
+- `PlanCache` 仅缓存 Algorithm 1 的 D 无关 dynamic search；key 绑定 recovery/topology/failure/survivor generation、model/config identity、完整 profile hash、Rdp/Rpp 和 memory capacity。`DecisionCenter.precompute_dynamic()` 接受显式 1..k 故障 `RecoveryState`；cache hit 不重跑 search，事故时 live source map、Hungarian/DSATUR manifest 和 Equation 8 仍每次重新构造。测试覆盖 hit/miss、故障状态/model/config/profile 过期、短/长 D 切换不复用 score/decision。
+- `profile` 执行真实 forward/backward/AdamW 与两进程 P2P/bootstrap calibration；`train` 使用现有 `SymmetricRuntime`；`recover-demo` 真实训练 3 steps、safe-point kill/join、预计算当前 dynamic search、Equation 8 选择、调用现有 `Runtime.recover()` 并续训。CLI JSON 记录 environment/version、seed、sample IDs/count、B/D、candidate times/scores、selected policy、source map、PID/exit code、state hashes、容差、actual topology/times 与 cleanup audit。
+- CPU/GPU runner 共用 `scripts/regression_runner.py` 的唯一 matrix，直接调度现有 01–14 以及 Task15 的 pytest 文件，无第二套恢复逻辑。matrix 在执行前审计所有 integration/distributed/e2e 文件恰好出现一次；CPU 分别调度真实 2/4/5/6/7 worker，GPU 分别调度 1/2/4/5/7/8 device。每阶段保存 JUnit 和完整 log，汇总 JSON 记录命令、退出码、数量、耗时与 `failed_stage`；任何 failure/error/skip 都使整体失败。8-GPU/container preflight 失败会在任何 suite 启动前停止。
+- 为本机 Windows/PyTorch 2.14 `FileStore` 无法解码中文工作目录的已知限制，runner 在 Windows 非 ASCII 工作区中自动创建短命 ASCII junction，仍运行同一仓库文件和相对 artifact 路径，且结束后删除 junction；Linux `/workspace` 直接运行。此适配不更换 FileStore、算法或恢复路径。
+- 首次 CPU runner 在 transfer calibration 阶段发现 Windows Gloo 在同一 TCP endpoint 重复销毁/初始化默认 group 会稳定超时；改为首轮建立默认 group，后续 bootstrap sample 执行真实 `new_group + barrier + destroy_process_group(subgroup)`，既保留真实 communicator/group 启动测量，又不复用已销毁的 rendezvous endpoint。单项复现修正后 1 passed，完整 calibration 回归 42 passed。
+- 新增 README 记录固定环境、Equation 8–14、D 来源边界、safe-point kill、global sample/loss/gradient 语义、全 trainable + AdamW 恢复、cache identity、CLI 和最终 runner。Ruff 按总计划要求在 `requirements.txt` 声明为仅开发检查工具，未自动安装。
+
+实际结果（本机 Windows 11 / Python 3.13.12 / pytest 9.1.1 / torch 2.14.0+cpu / 0 张可见 GPU；不替代固定容器）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/integration/test_cli.py tests/integration/test_plan_cache.py -q --device cpu` | 0 | 7 passed / 0 failed/errors/skipped；包含真实 CLI profile、4-worker train、kill/recover 与 cache identity/D 切换 |
+| `python -m pytest tests/unit -q --device cpu` | 0 | 887 passed / 0 failed/errors/skipped |
+| 首次 `python scripts/run_cpu_e2e.py` | 1 | unit 887、single integration 305、environment 4 通过；calibration 41 passed / 1 failed，定位重复 rendezvous 超时 |
+| calibration 修正后单项 / 完整文件 | 0 / 0 | 1 passed / 42 passed；真实 2-rank Gloo，audit clean |
+| 第二次 CPU runner | 1 | 前 1238 项通过；symmetric stage 因 Windows Unicode FileStore 路径 7 failed / 10 errors，所有 worker 在训练前失败 |
+| ASCII runner 单项验证 | 0 | 真实 4-worker `test_default_runtime_retains_metadata_without_training_tensor_backup` 1 passed，junction 执行/清理通过 |
+| 最终 `python scripts/run_cpu_e2e.py` | 0 | 12 stages / 1313 tests / 0 failures/errors/skipped；总阶段耗时 1008.15s |
+| 最终 CPU runner 分片 | 0 | unit 887；single integration 305；environment 4；calibration 42；symmetric 17；complete recovery 10；rerouting 12；scaled 2；asymmetric 16；adaptive 4；consecutive/unrecoverable/cleanup 11；CLI 3；每片 0 skipped |
+| `python -m compileall -q src tests scripts` | 0 | 全部 Python 文件语法检查通过 |
+| `python -m ruff check src tests scripts` | 1 | 本机 `No module named ruff`；已声明必需开发依赖，未获授权安装，不伪称 lint 通过 |
+| `python -m pytest tests/unit -q --device cuda --world-size 1 --require-gpu` | 4 | pytest 配置阶段硬失败：需 1 张 GPU，实际 0；无 skip/fallback |
+| `python scripts/run_gpu_e2e.py --world-size 8 --backend nccl` | 1 | preflight 硬失败：需 8 张 GPU，实际 0；`stages=[]`，未启动任何 suite，无 CPU fallback |
+| `git diff --check` | 0 | 通过；仅有 Git 的 LF/CRLF 工作区提示 |
+
+- 最终 CPU JSON 为 `artifacts/test-results/final-cpu-summary.json`，对应 12 份 `final-cpu-*.xml` JUnit 和 12 份 `final-cpu-*.log`；GPU preflight JSON 为 `artifacts/test-results/final-cuda-summary.json`。artifacts 为忽略的本地测试输出，不写入生产路径。
+- 当前状态：Task15 功能与本机真实 CPU 全量回归已完成；固定 Ubuntu `/workspace` CPU 复验、Ruff 可用环境检查和全部 8-GPU/NCCL 矩阵尚未执行。按总计划“任何 GPU 必测未运行不得标最终完成”，本次不将 Task15 标记为最终完成，也不声称有限测试证明任意模型/故障永远正确。
+
+固定容器复验入口（从项目工作目录执行，不自动安装依赖）：
+
+```bash
+python -m pytest tests/integration/test_cli.py tests/integration/test_plan_cache.py -q --device cpu
+python -m pytest tests/unit -q --device cpu
+python scripts/run_cpu_e2e.py
+python -m ruff check src tests scripts
+python -m compileall -q src tests scripts
+python -m pytest tests/unit -q --device cuda --world-size 1 --require-gpu
+python scripts/run_gpu_e2e.py --world-size 8 --backend nccl
+```
+
+服务器需回传 CPU/GPU summary JSON、全部 JUnit/log 及 runtime/CLI 审计 JSON。只有固定容器 CPU、Ruff 和全部 GPU 阶段都零 failure/error/skip，且报告字段通过复核后，才能将 Task15 和项目标记为最终完成。
+
+## Task 15 代码审阅修正（2026-09-15）
+
+- 审阅发现 `recover-demo` 在真实 kill 后才填充 cache，却把该搜索当作预故障开销隐藏，可能低估 dynamic transition 并污染 Equation 8。现由 `SymmetricRuntime.preview_recovery_state()` 在 committed safe point、全部 worker 存活时读取一次完整 inventory，构造假设故障状态并完成 dynamic search；真实 kill 后重新读取 live survivors，要求实际与预计算 `recovery_id` 一致，再命中 cache、重建 source map/manifest 并评分。
+- 撤销“首轮默认 group、后续 `new_group`”的混合 bootstrap 计时。当前先建立不计时基线组，每个正式样本均计时 `destroy_process_group + init_process_group + barrier`，各轮使用独立 TCP rendezvous 端口；全部端口均检查无监听且可复用。Windows 真实 2-rank Gloo、两轮重建已通过，不再以改变测量语义规避 endpoint 重用超时。
+- CLI profile 报告现覆盖 warm-up 与 profiling 实际消费的全部 sample IDs；`actual_times_s` 只包含数值秒字段。执行期异常会写 `status: failed`、错误类型/消息以及可用 audit，argparse 参数错误仍保持执行前退出。
+- regression runner 在启动子阶段前记录 `failed_stage`，阶段内部异常不再误报为 preflight；stdout 在产生时同步写日志，不再把完整输出保存在内存。新增测试覆盖部分日志保留和阶段异常归属。
+
+实际复验（同上本机 Windows CPU 环境，不替代固定容器）：
+
+| 命令 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/integration/test_plan_cache.py tests/unit/test_regression_runner.py -q --device cpu` | 0 | 7 passed；cache miss 搜索耗时、runner 流式日志/失败阶段覆盖 |
+| `python -m pytest tests/distributed/test_transfer_calibration.py -q --device cpu --world-size 2` | 0 | 42 passed；真实两进程、两轮完整默认组重建与 cleanup audit 通过 |
+| `python -m pytest tests/integration/test_cli.py tests/integration/test_plan_cache.py -q --device cpu` | 0 | 9 passed；真实 profile/train/pre-kill precompute/kill/recover 及失败 JSON 通过 |
+| `python -m pytest tests/unit -q --device cpu` | 0 | 889 passed / 0 failed/errors/skipped |
+| `python scripts/run_cpu_e2e.py` | 0 | 12 stages / 1317 tests / 0 failures/errors/skipped；阶段总耗时 1216.90s |
+| `python -m compileall -q src tests scripts`；`git diff --check` | 0 / 0 | 语法与差异检查通过；仅 Git LF/CRLF 提示 |
+| `python -m ruff check src tests scripts` | 1 | `No module named ruff`；未安装或修改环境，不记为通过 |
+| `python -m pytest tests/unit -q --device cuda --world-size 1 --require-gpu` | 1 | 需要 1 张真实 GPU，实际 0；执行前硬失败，无 skip/fallback |
+| `python scripts/run_gpu_e2e.py --world-size 8 --backend nccl` | 1 | 需要 8 张真实 GPU，实际 0；preflight 硬失败，未启动 suite，无 CPU fallback |
+
+- 本轮 CPU summary 为 `artifacts/test-results/final-cpu-summary.json`，12 个阶段均 `passed=true`、`failed_stage=null`；完整控制台输出为 `artifacts/test-results/final-cpu-console-review.log`。GPU preflight 记录为 `artifacts/test-results/final-cuda-summary.json`。
+- 当前仍不将 Task15 标记为最终完成：Ruff 尚未实际运行，固定 Ubuntu 容器 CPU 与 8-GPU/NCCL 完整矩阵尚未通过。
 
 ## 每次完成小功能的记录格式
 

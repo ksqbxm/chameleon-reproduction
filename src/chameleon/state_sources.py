@@ -118,12 +118,15 @@ def build_state_source_map(state: ClusterState, required: tuple[StateTensor, ...
             raise ValueError("inventory must describe the committed global step")
         if any(expected.get(t.key) != t for t in inventory.tensors):
             raise ValueError("worker tensor metadata differs from required inventory")
-    sources = []
+    sources, missing = [], []
     for module in sorted({t.module_id for t in required}):
         needed = {t for t in required if t.module_id == module}
         peers = tuple(i.worker for i in inventories if needed <= set(i.tensors))
         if not peers:
             names = ", ".join(sorted(f"{t.parameter_name}:{t.kind}" for t in needed))
-            raise UnrecoverableStateError(f"no complete survivor source for {module}: {names}")
-        sources.append((module, peers))
+            missing.append(f"{module}: {names}")
+        else:
+            sources.append((module, peers))
+    if missing:
+        raise UnrecoverableStateError("no complete survivor source for " + "; ".join(missing))
     return StateSourceMap(state, tuple(sorted(required, key=lambda t: t.key)), inventories, tuple(sources))

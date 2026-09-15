@@ -1,7 +1,6 @@
 """Single safe-point kill selects and executes both adaptive recovery policies."""
 
 from collections import Counter
-from copy import deepcopy
 from dataclasses import replace
 import json
 
@@ -40,77 +39,6 @@ def _assert_numerical_step(actual, expected, device, owner_counts):
     assert {name.split(".")[0] for name in owners} == {"embedding", "blocks", "final_norm", "lm_head"}
 
 
-def _base_profile(config, device):
-    import torch
-    from chameleon.model import build_initial_model
-    from chameleon.profiler import Profiler, train_profile_step
-
-    if device == "cuda":
-        torch.cuda.set_device(0)
-    model = build_initial_model(config, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=.007, weight_decay=.125, amsgrad=False)
-    state = ClusterState((WorkerIdentity("profile", 0, 0),), config.global_batch_size)
-    state, _ = train_profile_step(model, optimizer, state)
-    profiler = Profiler(model, optimizer)
-    for _ in range(2):
-        state, _ = train_profile_step(model, optimizer, state, profiler=profiler)
-    profile = profiler.snapshot()
-    del profiler, optimizer, model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    return profile
-
-
-def _controlled_profile(base, required):
-    """Use normal profile/calibration schemas, but make selection timing reproducible."""
-    profile = deepcopy(base)
-    durations = {"embedding": .01, "blocks.0": 1., "blocks.1": .05,
-                 "final_norm": .01, "lm_head": .01}
-    for module, duration in durations.items():
-        for kind in ("forward_s", "backward_s"):
-            series = profile["metrics"][f"modules.{module}.{kind}"]
-            series["samples"] = [duration] * len(series["samples"])
-            series["ema"] = duration
-    operation_s = sum(durations.values())
-    step_times = []
-    for step in profile["steps"]:
-        elapsed = 0.
-        for row in step["trace"]:
-            row["start_s"] = elapsed
-            elapsed += operation_s
-            row["end_s"] = elapsed
-        step_times.append(elapsed)
-    for name in ("step_time_s", "step_wall_time_s"):
-        series = profile["metrics"][name]
-        series["samples"] = step_times
-        ema = step_times[0]
-        for sample in step_times[1:]:
-            ema = profile["ema_alpha"] * sample + (1 - profile["ema_alpha"]) * ema
-        series["ema"] = ema
-    device = profile["identity"]["device"]["type"]
-    identities = [deepcopy(profile["identity"]["device"]) for _ in range(2)]
-    if device == "cuda":
-        identities[1]["index"] = 1
-    sizes = sorted({tensor.nbytes for tensor in required})
-    records = []
-    for rank in range(2):
-        transfers = [dict(source=source, destination=destination, tensor_bytes=size,
-                          iteration=iteration, execution_time_s=.25, wall_time_s=.25)
-                     for source, destination in ((0, 1), (1, 0))
-                     for size in sizes for iteration in range(2)]
-        records.append(dict(rank=rank, worker_id=f"calibration-{rank}", generation=0,
-                            pid=13130 + rank, device_identity=identities[rank],
-                            group_bootstrap_s=[.05, .05], transfers=transfers, verified=True))
-    profile["calibrations"] = [dict(schema_version=1, device=device,
-        backend="nccl" if device == "cuda" else "gloo", world_size=2,
-        tensor_bytes=sizes, iterations=2, bootstrap_rounds=2, records=records,
-        audit=dict(port=13130, rendezvous_dir="artifacts/test-results/task13-controlled-profile",
-                   workers=[dict(pid=13130 + rank, exitcode=0, alive=False) for rank in range(2)],
-                   leaked_pids=[], rendezvous_removed=True, port_listening=False,
-                   port_reusable=True, clean=True), error=None)]
-    return profile
-
-
 def _kill_one_stage_worker(runtime):
     failed_rank = 1
     failed_worker = runtime.topology.ranks[failed_rank]
@@ -128,6 +56,8 @@ def _score(candidate, duration):
 
 
 def _run_case(case, topology, profile, device, request):
+    from conftest import _controlled_adaptive_profile
+
     runtime = SymmetricRuntime(topology, device=device, capture_state=True,
                                lr=.007, weight_decay=.125)
     with runtime:
@@ -136,7 +66,8 @@ def _run_case(case, topology, profile, device, request):
         before = runtime.inspect_state()
         failure, killed_pid = _kill_one_stage_worker(runtime)
         recovery_state = runtime.recovery_state(failure)
-        selection_profile = _controlled_profile(profile, recovery_state.required)
+        selection_profile = _controlled_adaptive_profile(
+            profile, recovery_state.required, revision=0)
         center = DecisionCenter(topology.config, expected_identity=selection_profile["identity"],
                                 r_dp=(topology.dp_size,), r_pp=(1, 2),
                                 memory_capacity_bytes=10**15)
@@ -164,6 +95,7 @@ def _run_case(case, topology, profile, device, request):
 @pytest.fixture(scope="module")
 def adaptive_policy_runs(request):
     import torch
+    from conftest import _adaptive_base_profile
     from chameleon.environment import environment_report, validate_container, validate_device
     from chameleon.model import build_initial_model
     from chameleon.reference import ReferenceTrainer
@@ -181,7 +113,7 @@ def adaptive_policy_runs(request):
     stages = (("embedding", "blocks.0"), ("blocks.1", "final_norm", "lm_head"))
     workers = tuple(WorkerIdentity(f"adaptive-{rank:02d}", rank, 13)
                     for rank in range(expected_size))
-    base_profile = _base_profile(config, device)
+    base_profile = _adaptive_base_profile(config, device)
 
     runs = {}
     for case in ("short", "long"):

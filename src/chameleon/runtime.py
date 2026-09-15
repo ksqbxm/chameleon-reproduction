@@ -994,13 +994,13 @@ class SymmetricRuntime:
         if not isinstance(decision, PolicyDecision) or decision.candidate.execution is None:
             raise ValueError("recovery requires the unique selected Equation 8 execution plan")
         ranks = self._failure_ranks(failure)
+        if (decision.plan.generation != self.state.generation
+                or decision.plan.global_batch_size != self.state.global_batch_size):
+            raise ValueError("decision differs from the failed topology")
         with self._abort_on_error():
             deadline = time.monotonic() + self.timeout_s
             recovery, inspected = self._inspect_recovery(failure, ranks, deadline)
             execution = decision.candidate.execution
-            if (decision.plan.generation != self.state.generation
-                    or decision.plan.global_batch_size != self.state.global_batch_size):
-                raise ValueError("decision differs from the failed topology")
             survivors = tuple(sorted(recovery.survivor_state.workers, key=lambda w: w.worker_id))
             new_workers = tuple(WorkerIdentity(w.worker_id, rank, self.state.generation + 1)
                                 for rank, w in enumerate(survivors))

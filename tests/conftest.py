@@ -203,6 +203,85 @@ def rerouted_training(rerouted_run, request):
     return rerouted_run(((0, None), (1, 2), (3, 4)), (5, 3, 2))
 
 
+def _adaptive_base_profile(config, device):
+    import torch
+    from chameleon import ClusterState, WorkerIdentity
+    from chameleon.model import build_initial_model
+    from chameleon.profiler import Profiler, train_profile_step
+
+    if device == "cuda":
+        torch.cuda.set_device(0)
+    model = build_initial_model(config, device=device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.007, weight_decay=.125, amsgrad=False)
+    state = ClusterState((WorkerIdentity("profile", 0, 0),), config.global_batch_size)
+    state, _ = train_profile_step(model, optimizer, state)
+    profiler = Profiler(model, optimizer)
+    for _ in range(2):
+        state, _ = train_profile_step(model, optimizer, state, profiler=profiler)
+    profile = profiler.snapshot()
+    del profiler, optimizer, model
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return profile
+
+
+def _controlled_adaptive_profile(base, required, *, revision):
+    """Build one schema-valid deterministic profile for adaptive-policy functional tests."""
+    from copy import deepcopy
+
+    profile = deepcopy(base)
+    durations = {"embedding": .01, "blocks.0": 1., "blocks.1": .05,
+                 "final_norm": .01, "lm_head": .01}
+    for module, duration in durations.items():
+        for kind in ("forward_s", "backward_s"):
+            series = profile["metrics"][f"modules.{module}.{kind}"]
+            series["samples"] = [duration] * len(series["samples"])
+            series["ema"] = duration
+    operation_s = sum(durations.values())
+    step_times = []
+    for step in profile["steps"]:
+        elapsed = 0.
+        for row in step["trace"]:
+            row["start_s"] = elapsed
+            elapsed += operation_s
+            row["end_s"] = elapsed
+        step_times.append(elapsed)
+    for name in ("step_time_s", "step_wall_time_s"):
+        series = profile["metrics"][name]
+        series["samples"] = step_times
+        ema = step_times[0]
+        for sample in step_times[1:]:
+            ema = profile["ema_alpha"] * sample + (1 - profile["ema_alpha"]) * ema
+        series["ema"] = ema
+
+    device = profile["identity"]["device"]["type"]
+    identities = [deepcopy(profile["identity"]["device"]) for _ in range(2)]
+    if device == "cuda":
+        identities[1]["index"] = 1
+    sizes = sorted({tensor.nbytes for tensor in required})
+    transfer_s = .25 + revision * 1e-6
+    records = []
+    for rank in range(2):
+        transfers = [dict(source=source, destination=destination, tensor_bytes=size,
+                          iteration=iteration, execution_time_s=transfer_s, wall_time_s=transfer_s)
+                     for source, destination in ((0, 1), (1, 0))
+                     for size in sizes for iteration in range(2)]
+        records.append(dict(rank=rank, worker_id=f"calibration-{rank}", generation=0,
+                            pid=13130 + revision * 2 + rank,
+                            device_identity=identities[rank], group_bootstrap_s=[.05, .05],
+                            transfers=transfers, verified=True))
+    profile["calibrations"] = [dict(schema_version=1, device=device,
+        backend="nccl" if device == "cuda" else "gloo", world_size=2,
+        tensor_bytes=sizes, iterations=2, bootstrap_rounds=2, records=records,
+        audit=dict(port=13130 + revision,
+                   rendezvous_dir="artifacts/test-results/controlled-adaptive-profile",
+                   workers=[dict(pid=13130 + revision * 2 + rank, exitcode=0, alive=False)
+                            for rank in range(2)],
+                   leaked_pids=[], rendezvous_removed=True, port_listening=False,
+                   port_reusable=True, clean=True), error=None)]
+    return profile
+
+
 def _guarded_recovery_worker(*args, fault="normal"):
     """Spies delegate real training/group operations; recovery cannot initialize or load."""
     import time

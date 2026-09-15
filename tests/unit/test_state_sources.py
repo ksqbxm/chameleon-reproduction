@@ -53,6 +53,15 @@ def test_does_not_stitch_incomplete_replicas(sources_input):
         build_state_source_map(state, required, inventories)
 
 
+def test_unrecoverable_error_reports_every_missing_module(sources_input):
+    state, required, inventories = sources_input
+    partial = tuple(t for t in required if t.module_id not in {"embedding", "lm_head"})
+    inventories = tuple(replace(i, tensors=partial) for i in inventories)
+    with pytest.raises(UnrecoverableStateError) as captured:
+        build_state_source_map(state, required, inventories)
+    assert "embedding" in str(captured.value) and "lm_head" in str(captured.value)
+
+
 def test_complete_parameters_on_different_peers_are_not_a_complete_module(sources_input):
     state, required, _ = sources_input
     required = tuple(replace(t, module_id="blocks.0") for t in required)

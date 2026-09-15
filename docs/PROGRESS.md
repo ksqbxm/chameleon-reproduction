@@ -1043,6 +1043,43 @@ python -m pytest tests/e2e/test_kill_adaptive_policy.py -q --device cuda --world
 
 服务器需回传两份JUnit、完整终端输出及两条case生成的runtime JSON；只有CPU与8-GPU命令均零failure/error/skip，且报告中的policy、state/hash、PID、topology、实际耗时和cleanup断言全部通过后，才能确认Task13完成并进入Task14。
 
+## Task 14 连续故障与最后副本丢失实现（2026-09-15）
+
+- 已完整阅读 `CLAUDE.md`、`docs/MASTER_PLAN.md`、Task14、Task13及现有 DecisionCenter/Planner/Restorer/Runtime/state-source 路径；仓库无额外 `AGENTS.md`。修改前工作区干净，未安装、升级或修改任何依赖/环境，未访问目标服务器。
+- 修改范围：`src/chameleon/runtime.py`、`src/chameleon/state_sources.py`、`tests/conftest.py`、`tests/e2e/test_kill_adaptive_policy.py`、`tests/integration/test_recovery_contracts.py`、`tests/unit/test_state_sources.py`，新增 Task14 指定的三个 E2E 文件及本进度节。`Runtime.recover()` 在任何 survivor inspect/group 操作前依次验证真实故障事实与decision generation/B；漏报死亡worker不会再被旧decision错误掩盖，且两类拒绝均不创建新store或改变状态。未改动已验证的group/迁移/提交协议。
+- 连续故障真实路径：CPU DP3/PP2（GPU合同为DP4/PP2）先训练3个已提交step，kill stage-1 worker，以generation 14的survivor/state source和明确标注的受控功能profile重新生成两类candidate，由外部short D和Equation8选rerouting；真实执行peer额外任务并续训2 steps后，再kill当前topology的另一worker。第二次故障先确认旧decision在零状态变更前被拒绝，再以generation 15的新survivor/inventory/不同profile hash重新搜索，由long D和Equation8选dynamic，完成真实P2P迁移后续训2 steps。全7 steps的sample IDs连续且与不中断single-process reference的loss、全部gradients/parameters、AdamW step/exp_avg/exp_avg_sq逐项一致。
+- 最后副本边界：4个独立真实runtime分别以`blocks.0.linear1.weight`、`embedding.weight`、`final_norm.weight`、`lm_head.weight`为目标，按当前topology逐个kill该stage的全部健康DP副本。前DP-1次都从新inventory通过Equation8选rerouting并完成generation重建，AdamW step保持3且所有存活hash与初始安全点一致；最后一次在新topology/store创建前抛`UnrecoverableStateError`，generation/committed step/topology/recovery记录保持未提交状态。worker spy确认每个进程只初始化一次且从不`torch.load`；controller不含model/optimizer/reference/checkpoint或capture snapshot。
+- `build_state_source_map()` 仍以“同一健康worker拥有完整module的parameter+step+exp_avg+exp_avg_sq”为可恢复条件，但现在遍历全部required module后一次性报告所有最后副本丢失，不再在第一个缺失module停止；单测固化了多module完整inventory诊断。
+- 审阅收敛后，连续故障测试的source freshness改为独立oracle：直接从每次kill前的原始worker hash回复按当前survivor identity过滤，精确核对报告中的worker generation/rank、逐tensor digest、每个module的预期来源数，并将dynamic manifest每个action及P2P send/receive的digest绑定到对应现场source；不再调用production `build_state_source_map()`验证production日志。Task13/Task14原有三份profile构造逻辑已完全删除，统一为`tests/conftest.py`中的唯一共享构造路径，不保留兼容别名。
+- 资源压力路径连续3轮启动6个真实Gloo worker，启动后将controller硬超时设为1秒并注入真实worker hang。每轮都在硬超时后清理全6个PID、FileStore文件和目录，`leaked_pids=[]`、`rendezvous_port=None`、`clean=true`。结合连续故障成功路径与最后副本异常路径，覆盖成功/异常/超时三种最终清理。
+
+实际结果（本机 Windows 11 / Python3.13.12 / pytest9.1.1 / torch2.14.0+cpu / 0张可见GPU；未连接目标服务器）：
+
+| 命令 / 阶段 | 退出码 | 实际结果 |
+| --- | --- | --- |
+| `python -m pytest tests/e2e/test_consecutive_kills.py --collect-only -q --device cpu --world-size 6`，后扩展为三文件collect-only | 0 | 先4项、最终11项均独立收集成功 |
+| 项目原路径首次真实执行`test_consecutive_kills.py` | 1 | 4 setup errors；Windows/torch FileStore将工作区中文路径解码为乱码并报`DistStoreError`，未进入训练，与Task13已记录的本机限制一致 |
+| 纯ASCII临时目录联接指向同一工作区，执行Task14指定CPU命令（审阅优化后重跑） | 0 | 11 passed / 0 failed/errors/skipped，294.42s；真实6-worker Gloo，包含2次连续kill、4个独立场景共12次逐副本kill和3轮超时清理 |
+| Task14组合运行生成的8份代表runtime审计JSON | 0 | 全部`clean=true`、`leaks=0`；连续成功runtime为step7/generation16/2 recoveries/3 stores，4个最后副本runtime各有2次已提交rerouting后在step3原子拒绝，3个timeout runtime各清理6 workers/1 store |
+| `python -m pytest tests/unit/test_state_sources.py tests/integration/test_recovery_contracts.py -q --device cpu --world-size 4 --tb=short` | 0 | 81 passed，包含全inventory诊断与既有连续generation协议 |
+| selector/runtime/dynamic/routing/recovery相关7文件组合回归（含故障事实优先于decision freshness合同） | 0 | 311 passed / 0 failures/errors/skipped，38.57s |
+| Task13回归：`python -m pytest tests/e2e/test_kill_adaptive_policy.py -q --device cpu --world-size 6 --tb=short`（纯ASCII目录联接） | 0 | 4 passed，42.65s；共享profile路径下单故障rerouting/dynamic、数值对照与清理均未回归 |
+| `python -m pytest tests/unit -q --device cpu --world-size 4 --tb=short` | 0 | 887 passed / 0 failures/errors/skipped，46.09s |
+| Task14指定GPU命令 | 1 | pytest配置阶段硬失败：需8张真实可见GPU，实际0；没有skip、mock NCCL或CPU fallback |
+| `python -m compileall -q src tests`；`git diff --check`；最终差异审计 | 0 | 语法与diff检查通过，仅修改Task14直接相关生产逻辑、测试和本进度文档 |
+
+- Task14组合运行的代表审计为 `artifacts/test-results/runtime-pdezk6z3-cpu-float64-normal.json`、`runtime-{z1nlyjm4|zfejee3o|5s44kswh|jmnie_d9}-cpu-float64-normal.json`、`runtime-{hu3w3n20|i8yhh6k3|y_wmyuit}-cpu-float64-hang.json`。中文项目路径下的FileStore启动限制只影响本机Windows额外验证，不改动总计划规定的Ubuntu `/workspace` 容器合同。
+- 当前状态：Task14实现、真实CPU/Gloo功能路径和本机回归已完成；按总计划“GPU必测未执行不得标完成”的不可降级要求，固定容器CPU及8-GPU/NCCL验收仍待执行，因此不将Task14标记为最终完成。
+
+固定容器验收入口（项目工作目录使用既有python，不安装或修改环境）：
+
+```bash
+python -m pytest tests/e2e/test_consecutive_kills.py tests/e2e/test_unrecoverable_state.py tests/e2e/test_resource_cleanup.py -q --device cpu --world-size 6 --junitxml=artifacts/test-results/task14-server-cpu.xml
+python -m pytest tests/e2e/test_consecutive_kills.py tests/e2e/test_unrecoverable_state.py tests/e2e/test_resource_cleanup.py -q --device cuda --world-size 8 --require-gpu --junitxml=artifacts/test-results/task14-server-gpu.xml
+```
+
+服务器需回传两份JUnit、完整终端输出及Task14生成的runtime审计JSON；只有两条命令均零failure/error/skip，且连续generation、Equation8选择、最后副本原子拒绝和资源审计断言全部通过后，才能按总计划确认Task14完成并进入Task15。
+
 ## 每次完成小功能的记录格式
 
 - Task / 小功能：

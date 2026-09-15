@@ -235,6 +235,28 @@ def _prepare_failure(runtime):
     return failure, runtime.recovery_state(failure)
 
 
+def test_failure_facts_are_validated_before_decision_freshness(metadata_recovery_runtime):
+    from conftest import _kill_at_safe_point
+    from chameleon.contracts import FailureEvent
+
+    runtime = metadata_recovery_runtime
+    with runtime:
+        first_failure, first_recovery = _prepare_failure(runtime)
+        stale = _rerouting_decision(first_recovery)
+        runtime.recover(first_failure, stale)
+        complete = _kill_at_safe_point(runtime, (0,))
+        incomplete = FailureEvent((runtime.topology.ranks[1].worker_id,), complete.generation,
+                                  complete.committed_global_step)
+        stores = tuple(runtime._stores)
+        with pytest.raises(ValueError, match="FailureEvent omits a dead worker"):
+            runtime.recover(incomplete, stale)
+        assert runtime.state.generation == 1 and len(runtime.recoveries) == 1
+        assert tuple(runtime._stores) == stores
+        recovery = runtime.recovery_state(complete)
+        runtime.recover(complete, _rerouting_decision(recovery))
+    assert runtime.audit["clean"]
+
+
 @pytest.mark.parametrize("fault", ["none", "digest"])
 def test_survivor_control_protocol_commits_only_after_all_target_acks(metadata_recovery_runtime, monkeypatch, fault):
     from functools import partial
